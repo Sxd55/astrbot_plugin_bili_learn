@@ -1,0 +1,228 @@
+{
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "hint": "关闭后不搜索、不摘要、不入库。",
+    "default": true
+  },
+  "sessdata": {
+    "description": "B 站 SESSDATA（可选）",
+    "type": "string",
+    "hint": "留空则只搜索公开视频。填写后可读取登录可见的 AI 字幕。不要把 Cookie 发到群里或日志里。",
+    "default": "",
+    "sensitive": true
+  },
+  "interest_quotas": {
+    "description": "兴趣词与每轮入库数量",
+    "type": "template_list",
+    "hint": "每行一个兴趣词和它的每轮入库目标。刷取按列表顺序执行：第一个词刷到目标数再刷下一个；无限模式下跑完一轮接着下一轮，直到一轮没有新增。留空则回退到「兴趣关键词」+「每关键词每日配额」。",
+    "default": [],
+    "templates": {
+      "interest": {
+        "name": "兴趣词",
+        "display_item": "keyword",
+        "items": {
+          "keyword": {
+            "description": "兴趣词",
+            "type": "string",
+            "default": ""
+          },
+          "quota": {
+            "description": "每轮入库数量",
+            "type": "int",
+            "default": 3
+          }
+        }
+      }
+    }
+  },
+  "keywords": {
+    "description": "兴趣关键词（回退用）",
+    "type": "string",
+    "hint": "逗号分隔。仅当「兴趣词与每轮入库数量」为空时使用；同时作为知识库分区名和模型可选分区。",
+    "default": "聊天技巧,暧昧拉扯技巧,AI,SKILLS,提示词,科技,数码,构图,审美,艺术"
+  },
+  "exclude_keywords": {
+    "description": "排除词",
+    "type": "string",
+    "hint": "标题或简介命中则跳过。逗号分隔。",
+    "default": ""
+  },
+  "daily_start_hour": {
+    "description": "每日自动刷取时间（小时）",
+    "type": "int",
+    "hint": "每天几点开始自动刷取，默认 1（凌晨一点）。从该时间起，会把每个关键词的每日配额刷完为止。-1 表示不自动，只手动 /bilearn once。",
+    "default": 1
+  },
+  "summary_provider_id": {
+    "description": "摘要模型",
+    "type": "string",
+    "hint": "写摘要和汇总生成用。留空则用当前会话聊天模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "utility_provider_id": {
+    "description": "工具模型（复审/审核，可空）",
+    "type": "string",
+    "hint": "汇总复审和可信度审核用这个模型，建议选便宜的。留空则跟随摘要模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "embedding_provider_id": {
+    "description": "知识库 Embedding ID（可空）",
+    "type": "string",
+    "hint": "留空则使用 AstrBot 已配置的第一个 Embedding Provider。WebUI 的对话模型下拉选不了嵌入模型，所以这里不要用那个选择器。填了 ID 就用指定的。选定后不要改该库的向量维度。",
+    "default": ""
+  },
+  "rerank_provider_id": {
+    "description": "知识库 Rerank ID（可空）",
+    "type": "string",
+    "hint": "留空则使用 AstrBot 已配置的第一个 Rerank Provider；一个都没有就跳过重排。不要用对话模型下拉。",
+    "default": ""
+  },
+  "run_monitor_page": {
+    "description": "启用运行监控页",
+    "type": "bool",
+    "default": true
+  },
+  "kb_name": {
+    "description": "知识库名称",
+    "type": "string",
+    "hint": "插件启动时按名查找，没有则创建。",
+    "default": "Bili Learn"
+  },
+  "missing_subtitle": {
+    "description": "没有字幕时",
+    "type": "string",
+    "options": ["skip", "desc_only"],
+    "hint": "skip=跳过该视频（7 天后重试，最多 2 次）；desc_only=只用标题和简介。",
+    "default": "desc_only"
+  },
+  "on_demand_enabled": {
+    "description": "按需读视频（AI 工具）",
+    "type": "bool",
+    "hint": "开启后注册 bilibili_read 工具：用户发 B 站链接/BV 号时 AI 可自动读取并总结。需要 AstrBot >= 4.5.7。",
+    "default": true
+  },
+  "on_demand_ingest": {
+    "description": "按需读的视频也写入知识库",
+    "type": "bool",
+    "hint": "默认写入，同一 bvid 只写一次。命中排除词时不写。",
+    "default": true
+  },
+  "subtitle_page_limit": {
+    "description": "读取字幕的分 P 数",
+    "type": "int",
+    "hint": "多 P 视频读取前 N P 的字幕并合并。0 表示全部（长视频消耗更多 token）。",
+    "default": 3
+  },
+  "subtitle_max_chars": {
+    "description": "送入模型的字幕上限（字符）",
+    "type": "int",
+    "hint": "超长字幕取开头、中间、结尾三段。默认 12000。",
+    "default": 12000
+  },
+  "subtitle_verify": {
+    "description": "校验字幕与标题是否匹配",
+    "type": "bool",
+    "hint": "B 站偶尔返回指向其他视频的缓存字幕，开启后可跳过明显不匹配的字幕轨。",
+    "default": true
+  },
+  "max_duration_minutes": {
+    "description": "后台学习的视频时长上限（分钟）",
+    "type": "int",
+    "hint": "超过则跳过（只对定时/手动批量学习生效，按需读不受限）。0 表示不限。",
+    "default": 120
+  },
+  "unlimited_mode": {
+    "description": "无限模式（消耗大量 token）",
+    "type": "bool",
+    "hint": "开启后不做每日配额限制：按兴趣词列表顺序刷取，跑完一轮接着下一轮，直到某轮没有新增入库才停止。开启并保存/重载后会立即开始刷取（监控页的开关点开也会立即开始）。token 消耗很大，慎开。",
+    "default": false
+  },
+  "run_max_videos": {
+    "description": "单次运行最多处理条数",
+    "type": "int",
+    "hint": "一次运行（含无限模式的多轮）最多处理多少条视频，防止失控烧 token。默认 100。",
+    "default": 100
+  },
+  "daily_per_keyword": {
+    "description": "每关键词每日入库配额",
+    "type": "int",
+    "hint": "配额模式（无限模式关闭）下，每个关键词每天最多入库的视频数，达到后当天停止该关键词，第二天恢复。0 表示不限。",
+    "default": 3
+  },
+  "daily_quota_overrides": {
+    "description": "单关键词配额覆盖",
+    "type": "string",
+    "hint": "逗号分隔，如 AI:5,科技:2；未列出的关键词使用上面的统一配额。",
+    "default": ""
+  },
+  "category_min_score": {
+    "description": "归类相关度门槛（0-100）",
+    "type": "int",
+    "hint": "模型给「分区」打的与视频内容相关度低于该值时，归入「其他」不入库。0=关闭该判断。",
+    "default": 80
+  },
+  "consolidate_enabled": {
+    "description": "知识汇总",
+    "type": "bool",
+    "hint": "某关键词未并入的视频达到阈值后，自动生成只增不删的主题汇总文档（生成+复审两次调用）。",
+    "default": true
+  },
+  "consolidate_threshold": {
+    "description": "汇总触发数量",
+    "type": "int",
+    "hint": "同一关键词未并入的视频达到该数量后触发汇总。建议 5-20。",
+    "default": 10
+  },
+  "consolidate_delete_sources": {
+    "description": "汇总后删除原视频文档",
+    "type": "bool",
+    "hint": "汇总成功且新知识已追加后，从知识库删除原视频文档（本地 SQLite 仍保留摘要和素材，可重建）。",
+    "default": true
+  },
+  "audit_enabled": {
+    "description": "可信度审核",
+    "type": "bool",
+    "hint": "定期用模型对照留存的字幕素材，检查文档里有没有虚构事实，只标记不修改。",
+    "default": true
+  },
+  "audit_interval_days": {
+    "description": "审核间隔（天）",
+    "type": "int",
+    "hint": "文档超过该天数未审核就会进入审核队列。默认 7 天。",
+    "default": 7
+  },
+  "audit_daily_limit": {
+    "description": "每日审核上限（篇）",
+    "type": "int",
+    "hint": "每天最多审核多少篇，把成本摊到每天。0=不限（不推荐）。",
+    "default": 20
+  },
+  "audit_excerpt_chars": {
+    "description": "审核素材上限（字符）",
+    "type": "int",
+    "hint": "审核时送给模型的素材长度。核查虚构事实不需要全文，默认 4000，越小越省 token。",
+    "default": 4000
+  },
+  "request_interval_seconds": {
+    "description": "请求间隔（秒）",
+    "type": "int",
+    "hint": "打 B 站接口的最小间隔，带随机抖动。命中限流会自动全局冷却。",
+    "default": 3
+  },
+  "ui_theme": {
+    "description": "监控页配色",
+    "type": "string",
+    "default": "mist",
+    "invisible": true
+  },
+  "ui_theme_custom": {
+    "description": "监控页自定义配色",
+    "type": "dict",
+    "default": {},
+    "items": {},
+    "invisible": true
+  }
+}

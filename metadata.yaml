@@ -1,0 +1,9 @@
+---
+name: astrbot_plugin_bili_learn
+display_name: Savage Evolution
+short_desc: Savage Evolution：从 B 站公开视频学习短摘要并写入 AstrBot 官方知识库。
+desc: Cookie 选填；无 Cookie 时仅搜索公开内容。支持 AI 按需读单个视频（发链接/BV号）、关键词门禁、兴趣词逐项配额与顺序刷取、无限模式轮次循环、知识汇总（只增不删）、可信度审核、多P字幕、失败重试、风控冷却与运行监控。不互动、不改人格。
+version: v1.9.1
+author: Sxd55
+repo: https://github.com/Sxd55/astrbot_plugin_bili_learn
+astrbot_version: ">=4.5.7"

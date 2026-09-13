@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bili Learn</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="toast" hidden></div>
+  <main class="wrap">
+    <header>
+      <div>
+        <h1>Bili Learn</h1>
+        <p class="sub">公开视频学习 → 短摘要 → 知识库 → 汇总与审核</p>
+      </div>
+      <div class="actions">
+        <button type="button" data-act="refresh">刷新</button>
+        <button type="button" class="ghost" data-act="health">健康检查</button>
+        <button type="button" data-act="unlimited">无限模式：关</button>
+        <button type="button" class="primary" data-act="run">手动试跑</button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>配色方案</h2>
+      <div class="themes" id="themes"></div>
+      <div class="custom-theme" id="customTheme">
+        <label class="color-field">背景<input type="color" id="cBg" value="#e0e5ec" /></label>
+        <label class="color-field">暗阴影<input type="color" id="cDark" value="#b8bcc2" /></label>
+        <label class="color-field">高光<input type="color" id="cLight" value="#ffffff" /></label>
+        <label class="color-field">强调色<input type="color" id="cAccent" value="#6d5dfc" /></label>
+        <button type="button" class="tiny" data-act="custom-apply">应用自定义</button>
+      </div>
+    </section>
+
+    <section class="stats" id="stats"></section>
+    <section class="status" id="status"></section>
+
+    <section class="panel">
+      <h2>兴趣词与每轮入库数量</h2>
+      <p class="sub">按列表顺序刷取：第一个词入库到目标数量，再刷下一个词。无限模式下跑完一轮接着下一轮。</p>
+      <div id="interest"></div>
+      <div class="interest-actions">
+        <button type="button" class="tiny" data-act="interest-add">+ 添加兴趣词</button>
+        <button type="button" class="primary" data-act="interest-save">保存兴趣词</button>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="panel full">
+        <h2>运行记录</h2>
+        <p class="sub">每次 cron 或手动试跑都会生成一条记录，点击查看阶段时间线。</p>
+        <div class="scroll" id="runs"></div>
+      </section>
+      <section class="panel">
+        <h2>阶段时间线</h2>
+        <p class="sub">选一条运行记录后显示。</p>
+        <div class="scroll" id="events"></div>
+      </section>
+      <section class="panel">
+        <h2>视频处理</h2>
+        <p class="sub">最近处理的 bvid、归类与审核状态。</p>
+        <div class="scroll" id="videos"></div>
+      </section>
+      <section class="panel">
+        <h2>汇总文档</h2>
+        <p class="sub">只增不删的主题知识文档。</p>
+        <div class="scroll" id="digests"></div>
+      </section>
+      <section class="panel">
+        <h2>诊断</h2>
+        <p class="sub">接口返回原文，便于排查。</p>
+        <pre id="diag"></pre>
+      </section>
+    </div>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
