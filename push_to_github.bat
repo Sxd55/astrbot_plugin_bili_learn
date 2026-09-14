@@ -8,6 +8,8 @@ REM 你的 GitHub 仓库地址。如果你把仓库改名了，这里也要改�
 set "REPO_URL=https://github.com/Sxd55/astrbot_plugin_bili_learn.git"
 REM 分支名
 set "BRANCH=main"
+REM 代理地址：直连 GitHub 失败时自动用它重试。Clash 默认 7897，v2ray 常见 10809；不用代理就留空。
+set "PROXY=http://127.0.0.1:7897"
 REM ==========================================================
 
 cd /d "%~dp0"
@@ -60,11 +62,18 @@ if errorlevel 1 (
 echo [5/5] 推送到 %BRANCH% ...
 git push -u origin %BRANCH%
 if errorlevel 1 (
+    if not "%PROXY%"=="" (
+        echo [提示] 直连失败，改用代理 %PROXY% 重试...
+        git -c http.proxy=%PROXY% -c https.proxy=%PROXY% push -u origin %BRANCH%
+    )
+)
+if errorlevel 1 (
     echo.
     echo [推送失败] 常见原因：
     echo   1. GitHub 上还没有这个仓库：先打开 https://github.com/new 建一个空仓库
     echo   2. 仓库地址不对：编辑本文件顶部的 REPO_URL
     echo   3. 首次推送需要登录：按弹窗提示登录 GitHub 即可
+    echo   4. 网络连不上 GitHub：确认代理软件已启动，并检查本文件顶部的 PROXY 端口
     echo.
     pause
     exit /b 1
