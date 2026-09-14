@@ -1,4 +1,4 @@
-"""LLM 工具 bilibili_read：按需读取单个视频并返回摘要素材。"""
+"""LLM 工具：bilibili_read 按需读单个视频，bilibili_knowledge 查询已学知识库。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from pydantic.dataclasses import dataclass
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
+
+from .query import format_for_llm, unwrap_arguments
 
 
 @dataclass(config=dict(arbitrary_types_allowed=True))
@@ -37,6 +39,7 @@ class BilibiliReadTool(FunctionTool[AstrAgentContext]):
     ingest: bool = True
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        kwargs = unwrap_arguments(kwargs)
         reference = str(kwargs.get("reference") or kwargs.get("bvid") or "").strip()
         if not reference:
             return "没有收到视频链接或 BV 号。"
@@ -79,3 +82,54 @@ class BilibiliReadTool(FunctionTool[AstrAgentContext]):
             ]
         )
         return "\n".join(lines)
+
+
+@dataclass(config=dict(arbitrary_types_allowed=True))
+class BilibiliKnowledgeTool(FunctionTool[AstrAgentContext]):
+    name: str = "bilibili_knowledge"
+    description: str = (
+        "查询 Bili Learn 知识库（由 B 站公开视频自动学习、汇总生成）。"
+        "当用户询问某个主题、让你介绍或总结学过的知识、问「你学过什么」，"
+        "或你需要引用之前学习的内容时调用。"
+        "query 填要查的问题或关键词；想读某篇文档的完整内容时，"
+        "把检索结果里的文档名填进 doc_name；两者都留空则返回知识库概览（已学主题列表）。"
+        "可以连续调用：先看概览找主题，再检索，再读全文，直到能回答用户。"
+        "回答时必须基于返回内容，不要编造；内容来自视频摘要，不是亲历。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要查询的问题或关键词，例如「构图技巧」「提示词怎么写」；留空则返回知识库概览。",
+                },
+                "doc_name": {
+                    "type": "string",
+                    "description": "可选：要读全文的文档名（先检索拿到文档名再读）。填了它时忽略 query。",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "可选：返回几条检索结果，默认跟随插件配置（5 条，上限 10）。",
+                },
+            },
+            "required": [],
+        }
+    )
+    query_knowledge: Any = None
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        kwargs = unwrap_arguments(kwargs)
+        query = str(kwargs.get("query") or "").strip()
+        doc_name = str(kwargs.get("doc_name") or "").strip()
+        try:
+            top_k = int(kwargs.get("top_k") or 0)
+        except (TypeError, ValueError):
+            top_k = 0
+        if self.query_knowledge is None:
+            return "插件内部错误：知识库查询未注入。"
+        try:
+            result = await self.query_knowledge(query=query, top_k=top_k, doc_name=doc_name)
+        except Exception as exc:  # noqa: BLE001
+            return f"知识库查询失败：{exc}"
+        return format_for_llm(result)

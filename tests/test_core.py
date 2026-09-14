@@ -37,6 +37,11 @@ from bili.ingest import (  # noqa: E402
     worth_keeping,
 )
 from bili.pipeline import LearnPipeline  # noqa: E402
+from bili.query import (  # noqa: E402
+    format_for_chat,
+    format_for_llm,
+    unwrap_arguments,
+)
 from bili.reference import command_remainder, extract_video_reference  # noqa: E402
 from bili.store import AuditStore  # noqa: E402
 
@@ -434,6 +439,50 @@ class StoreTest(unittest.TestCase):
         digest_brief = self.store.all_digest_briefs()[0]
         self.assertNotIn("content", digest_brief)
         self.assertEqual(digest_brief["rounds"], 1)
+
+    def test_search_local_finds_videos_and_digests(self):
+        self.store.mark_ingested(
+            "BV1",
+            title="构图入门",
+            category="构图",
+            doc_name="构图｜构图入门.md",
+            summary="三分法是最基础的构图技巧。",
+        )
+        self.store.mark_excluded("BV2", "excluded", title="别的", summary="不相关")
+        self.store.save_digest(
+            "AI",
+            doc_name="【汇总】AI｜主题知识.md",
+            rounds=1,
+            sources=2,
+            content="提示词要写清角色和输出格式。",
+        )
+        hits = self.store.search_local("构图")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["kind"], "video")
+        self.assertEqual(hits[0]["bvid"], "BV1")
+        digest_hits = self.store.search_local("提示词")
+        self.assertEqual(len(digest_hits), 1)
+        self.assertEqual(digest_hits[0]["kind"], "digest")
+        self.assertEqual(self.store.search_local("不存在的词"), [])
+
+    def test_search_local_splits_tokens_and_escapes_wildcards(self):
+        self.store.mark_ingested("BV1", title="AI 提示词", summary="写提示词的经验")
+        self.store.mark_ingested("BV2", title="折扣", summary="全场100%好评")
+        self.assertTrue(self.store.search_local("AI 提示词"))
+        self.assertEqual([h["bvid"] for h in self.store.search_local("%")], ["BV2"])
+        self.assertEqual([h["bvid"] for h in self.store.search_local("100%")], ["BV2"])
+        self.assertEqual(self.store.search_local("100_"), [])
+        self.assertEqual(self.store.search_local(""), [])
+
+    def test_category_counts_and_recent_ingested(self):
+        self.store.mark_ingested("BV1", title="a", category="AI", summary="s")
+        self.store.mark_ingested("BV2", title="b", category="AI", summary="s")
+        self.store.mark_ingested("BV3", title="c", category="科技", summary="s")
+        counts = self.store.category_counts()
+        self.assertEqual(counts[0], {"category": "AI", "count": 2})
+        recent = self.store.recent_ingested(2)
+        self.assertEqual(len(recent), 2)
+        self.assertIn("title", recent[0])
 
 
 class MigrationTest(unittest.TestCase):
@@ -1097,6 +1146,118 @@ class PipelineAuditTest(unittest.TestCase):
         prompt = self.prompts[0]
         self.assertNotIn("x" * 1200, prompt)
         self.assertIn("x" * 900, prompt)
+
+
+class KnowledgeQueryTest(unittest.TestCase):
+    def test_unwrap_arguments_layers(self):
+        self.assertEqual(
+            unwrap_arguments({"arguments": {"query": "构图"}}), {"query": "构图"}
+        )
+        self.assertEqual(
+            unwrap_arguments({"arguments": {"arguments": {"query": "构图"}}}),
+            {"query": "构图"},
+        )
+        self.assertEqual(
+            unwrap_arguments({"arguments": '{"query": "构图"}'}), {"query": "构图"}
+        )
+        self.assertEqual(unwrap_arguments({"query": "构图"}), {"query": "构图"})
+        self.assertEqual(unwrap_arguments({"arguments": "not json"})["arguments"], "not json")
+        self.assertEqual(unwrap_arguments(None), {})
+
+    def test_llm_search_text_has_doc_and_note(self):
+        result = {
+            "ok": True,
+            "mode": "search",
+            "source": "kb",
+            "query": "构图",
+            "items": [
+                {
+                    "kind": "kb",
+                    "doc_name": "构图｜构图入门.md",
+                    "score": 0.834,
+                    "content": "三分法是最基础的构图技巧。",
+                }
+            ],
+        }
+        text = format_for_llm(result)
+        self.assertIn("构图｜构图入门.md", text)
+        self.assertIn("0.83", text)
+        self.assertIn("三分法", text)
+        self.assertIn("不是亲历", text)
+
+    def test_llm_local_text_has_url(self):
+        result = {
+            "ok": True,
+            "mode": "search",
+            "source": "local",
+            "query": "构图",
+            "items": [
+                {
+                    "kind": "video",
+                    "bvid": "BV1xx",
+                    "title": "构图入门",
+                    "status": "ingested",
+                    "summary": "本地摘要",
+                }
+            ],
+        }
+        text = format_for_llm(result)
+        self.assertIn("https://www.bilibili.com/video/BV1xx", text)
+        self.assertIn("本地摘要库", text)
+
+    def test_llm_search_total_is_capped(self):
+        item = {"kind": "kb", "doc_name": "d", "score": 1.0, "content": "x" * 900}
+        result = {"ok": True, "mode": "search", "source": "kb", "query": "q", "items": [item] * 20}
+        text = format_for_llm(result)
+        self.assertLessEqual(text.count("【素材"), 8)
+        self.assertIn("已省略", text)
+
+    def test_llm_doc_truncation_note(self):
+        result = {"ok": True, "mode": "doc", "doc_name": "d.md", "content": "y" * 9000}
+        text = format_for_llm(result)
+        self.assertIn("【文档全文】d.md", text)
+        self.assertIn("文档过长", text)
+        self.assertNotIn("y" * 6100, text)
+
+    def test_llm_empty_and_error(self):
+        self.assertIn("没有", format_for_llm({"ok": True, "mode": "empty", "query": "q"}))
+        self.assertIn(
+            "没有找到文档", format_for_llm({"ok": False, "mode": "doc", "note": "没有找到文档「x」"})
+        )
+        self.assertIn("没有返回可用结果", format_for_llm(None))
+
+    def test_chat_search_and_overview(self):
+        chat = format_for_chat(
+            {
+                "ok": True,
+                "mode": "search",
+                "source": "kb",
+                "query": "构图",
+                "items": [
+                    {
+                        "kind": "kb",
+                        "doc_name": "构图｜构图入门.md",
+                        "score": 0.83,
+                        "content": "三分法。",
+                    }
+                ],
+            }
+        )
+        self.assertIn("命中 1 条", chat)
+        self.assertIn("构图｜构图入门.md", chat)
+        overview = format_for_chat(
+            {
+                "ok": True,
+                "mode": "overview",
+                "counts": {"ingested": 12, "excluded": 3, "no_subtitle": 1, "failed": 0, "digests": 2},
+                "categories": [{"category": "AI", "count": 8}],
+                "digests": [{"keyword": "AI", "rounds": 2, "sources": 10}],
+                "recent": [{"bvid": "BV1", "title": "示例"}],
+            }
+        )
+        self.assertIn("已入库视频 12 条", overview)
+        self.assertIn("AI 8", overview)
+        self.assertIn("汇总主题", overview)
 
 
 if __name__ == "__main__":

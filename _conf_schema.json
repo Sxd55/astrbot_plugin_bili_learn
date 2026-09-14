@@ -110,6 +110,18 @@
     "hint": "默认写入，同一 bvid 只写一次。命中排除词时不写。",
     "default": true
   },
+  "query_enabled": {
+    "description": "知识库查询（AI 工具）",
+    "type": "bool",
+    "hint": "开启后注册 bilibili_knowledge 工具：用户问某个主题时 AI 可检索知识库、读单篇文档全文、看知识库概览，再据内容回答。知识库检索不可用时自动回退本地摘要库。",
+    "default": true
+  },
+  "query_top_k": {
+    "description": "查询返回条数",
+    "type": "int",
+    "hint": "每次检索返回的知识片段条数，默认 5，上限 10。",
+    "default": 5
+  },
   "subtitle_page_limit": {
     "description": "读取字幕的分 P 数",
     "type": "int",

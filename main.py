@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -10,22 +11,23 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_p
 
 from .bili.client import BiliClient
 from .bili.pipeline import LearnPipeline
+from .bili.query import format_for_chat
 from .bili.reference import command_remainder
 from .bili.runlog import fmt_ts
 from .bili.store import AuditStore
 
 PLUGIN_NAME = "astrbot_plugin_bili_learn"
-PLUGIN_VERSION = "1.9.1"
+PLUGIN_VERSION = "1.10.0"
 
 
-def _tool_class():
+def _tool_classes():
     try:
-        from .bili.tool import BilibiliReadTool
+        from .bili.tool import BilibiliKnowledgeTool, BilibiliReadTool
 
-        return BilibiliReadTool
+        return BilibiliReadTool, BilibiliKnowledgeTool
     except Exception as exc:  # noqa: BLE001
         logger.warning("Bili Learn: FunctionTool unavailable: %s", exc)
-        return None
+        return None, None
 
 
 def _data_dir() -> Path:
@@ -67,6 +69,7 @@ class BiliLearnPlugin(Star):
         self._cron_id = None
         self._kb_id = ""
         self._tool = None
+        self._query_tool = None
         self._run_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task] = set()
         self._register_tool()
@@ -155,21 +158,34 @@ class BiliLearnPlugin(Star):
         return f"每天{hour:02d}:00"
 
     def _register_tool(self) -> None:
-        if not bool(self.config.get("on_demand_enabled", True)):
-            return
-        tool_cls = _tool_class()
+        read_cls, query_cls = _tool_classes()
         register = getattr(self.context, "add_llm_tools", None)
-        if tool_cls is None or not callable(register):
+        if read_cls is None or not callable(register):
             logger.warning(
-                "Bili Learn: AstrBot 不支持 LLM 工具，按需读视频不可用（需要 AstrBot >= 4.5.7）"
+                "Bili Learn: AstrBot 不支持 LLM 工具，按需读与知识查询不可用（需要 AstrBot >= 4.5.7）"
             )
             return
-        self._tool = tool_cls(
-            pipeline=self.pipeline,
-            ingest=bool(self.config.get("on_demand_ingest", True)),
+        tools = []
+        if bool(self.config.get("on_demand_enabled", True)):
+            self._tool = read_cls(
+                pipeline=self.pipeline,
+                ingest=bool(self.config.get("on_demand_ingest", True)),
+            )
+            tools.append(self._tool)
+        if bool(self.config.get("query_enabled", True)) and query_cls is not None:
+            self._query_tool = query_cls(query_knowledge=self._query_knowledge)
+            tools.append(self._query_tool)
+        if not tools:
+            return
+        try:
+            register(*tools)
+        except TypeError:
+            for tool in tools:
+                register(tool)
+        logger.info(
+            "Bili Learn: registered tools %s",
+            "、".join(getattr(tool, "name", "?") for tool in tools),
         )
-        register(self._tool)
-        logger.info("Bili Learn: registered tool bilibili_read")
 
     async def terminate(self):
         try:
@@ -370,6 +386,172 @@ class BiliLearnPlugin(Star):
             raise RuntimeError("knowledge base delete unsupported")
         await deleter(doc_id)
 
+    def _query_top_k(self, top_k: Any = 0) -> int:
+        try:
+            value = int(top_k) if top_k else int(self.config.get("query_top_k") or 5)
+        except (TypeError, ValueError):
+            value = 5
+        return max(1, min(10, value))
+
+    def _kb_name(self) -> str:
+        return str(self.config.get("kb_name") or "Bili Learn")
+
+    async def _kb_retrieve(self, query: str, top_k: int) -> list[dict[str, Any]] | None:
+        """知识库语义检索；不可用时返回 None（调用方回退本地摘要库）。"""
+        kb_id = self._kb_id or await self._ensure_kb()
+        if not kb_id:
+            return None
+        retrieve = getattr(self.context.kb_manager, "retrieve", None)
+        if not callable(retrieve):
+            return None
+        try:
+            try:
+                data = await retrieve(
+                    query=query,
+                    kb_names=[self._kb_name()],
+                    top_k_fusion=20,
+                    top_m_final=top_k,
+                )
+            except TypeError:
+                data = await retrieve(query, [self._kb_name()])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Bili Learn: knowledge retrieval failed: %s", exc)
+            return None
+        if not isinstance(data, dict):
+            return None
+        items: list[dict[str, Any]] = []
+        for row in (data.get("results") or [])[:top_k]:
+            if not isinstance(row, dict):
+                continue
+            items.append(
+                {
+                    "kind": "kb",
+                    "doc_name": str(row.get("doc_name") or ""),
+                    "score": row.get("score"),
+                    "content": str(row.get("content") or ""),
+                    "doc_id": str(row.get("doc_id") or ""),
+                }
+            )
+        return items
+
+    async def _kb_doc_text(self, doc_name: str) -> str:
+        """按文件名读知识库文档全文；读不到返回空串。"""
+        if not doc_name:
+            return ""
+        kb_id = self._kb_id or await self._ensure_kb()
+        if not kb_id:
+            return ""
+        helper = await self.context.kb_manager.get_kb(kb_id)
+        if helper is None:
+            return ""
+        lister = getattr(helper, "list_documents", None)
+        if not callable(lister):
+            return ""
+        try:
+            try:
+                docs = await lister(0, 10, search=doc_name)
+            except TypeError:
+                docs = await lister()
+        except Exception:  # noqa: BLE001
+            return ""
+        doc_id = ""
+        for doc in docs or []:
+            if str(getattr(doc, "doc_name", "") or "") == doc_name:
+                doc_id = str(getattr(doc, "doc_id", "") or "")
+                break
+        if not doc_id:
+            for doc in docs or []:
+                if doc_name in str(getattr(doc, "doc_name", "") or ""):
+                    doc_id = str(getattr(doc, "doc_id", "") or "")
+                    break
+        if not doc_id:
+            return ""
+        getter = getattr(helper, "get_chunks_by_doc_id", None)
+        if not callable(getter):
+            return ""
+        try:
+            chunks = await getter(doc_id, 0, 200)
+        except Exception:  # noqa: BLE001
+            return ""
+        rows = [row for row in (chunks or []) if isinstance(row, dict)]
+        rows.sort(key=lambda row: int(row.get("chunk_index") or 0))
+        return "\n".join(str(row.get("content") or "") for row in rows).strip()
+
+    def _knowledge_overview(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "mode": "overview",
+            "kb_ready": bool(self._kb_id),
+            "counts": self.store.counts(),
+            "categories": self.store.category_counts(),
+            "digests": self.store.all_digest_briefs()[:20],
+            "recent": self.store.recent_ingested(10),
+        }
+
+    async def _query_knowledge(
+        self, query: str = "", top_k: Any = 0, doc_name: str = ""
+    ) -> dict[str, Any]:
+        """统一的查询入口：工具和命令都走这里。
+
+        优先知识库语义检索，不可用或没命中时回退本地 SQLite 摘要搜索。
+        """
+        query = str(query or "").strip()
+        doc_name = str(doc_name or "").strip()
+        k = self._query_top_k(top_k)
+        if not query and not doc_name:
+            return self._knowledge_overview()
+        if doc_name:
+            text = await self._kb_doc_text(doc_name)
+            if text:
+                return {
+                    "ok": True,
+                    "mode": "doc",
+                    "source": "kb",
+                    "doc_name": doc_name,
+                    "content": text,
+                }
+            local = self.store.search_local(doc_name, limit=3)
+            if local:
+                return {
+                    "ok": True,
+                    "mode": "search",
+                    "source": "local",
+                    "query": doc_name,
+                    "items": local,
+                    "note": "知识库里没有这篇文档，以下是本地摘要库的匹配结果。",
+                }
+            return {
+                "ok": False,
+                "mode": "doc",
+                "doc_name": doc_name,
+                "note": f"没有找到文档「{doc_name}」，可以先用 query 检索。",
+            }
+        kb_items = await self._kb_retrieve(query, k)
+        if kb_items:
+            return {
+                "ok": True,
+                "mode": "search",
+                "source": "kb",
+                "query": query,
+                "items": kb_items,
+            }
+        local_items = self.store.search_local(query, limit=k)
+        if local_items:
+            return {
+                "ok": True,
+                "mode": "search",
+                "source": "local",
+                "query": query,
+                "items": local_items,
+                "note": "知识库语义检索不可用或没有命中，以下是本地摘要库的关键词匹配结果。",
+            }
+        return {
+            "ok": True,
+            "mode": "empty",
+            "query": query,
+            "note": f"知识库和本地摘要库都没有和「{query}」相关的内容。",
+        }
+
     @filter.command_group("bilearn")
     def bilearn(self):
         pass
@@ -393,6 +575,7 @@ class BiliLearnPlugin(Star):
             f"审核可疑={audit.get('suspect', 0)} "
             f"Cookie={'有' if self.client.sessdata else '无'} "
             f"按需读={'开' if self._tool else '关'} "
+            f"知识查询={'开' if self._query_tool else '关'} "
             f"模式={mode} 今日已入库={quota_desc} "
             f"Embedding={emb} Rerank={rerank} "
             f"上次运行={last.get('status') if last else '无'} "
@@ -427,6 +610,18 @@ class BiliLearnPlugin(Star):
             f"文档：{result.get('doc_name') or '未写入'}\n\n"
             f"{result.get('summary')}"
         )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @bilearn.command("search")
+    async def cmd_search(self, event: AstrMessageEvent):
+        """查询知识库学过的内容；不带参数列出概览"""
+        query = command_remainder(event.message_str, "search").strip()
+        try:
+            result = await self._query_knowledge(query=query)
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"查询失败：{exc}")
+            return
+        yield event.plain_result(format_for_chat(result))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @bilearn.command("once")
@@ -634,6 +829,7 @@ class BiliLearnPlugin(Star):
             "rerank": rerank or "not_configured",
             "knowledge_base": "ready" if kb_ready else "missing_embedding_provider",
             "on_demand_tool": "ready" if self._tool else "disabled_or_unsupported",
+            "knowledge_query": "ready" if self._query_tool else "disabled_or_unsupported",
             "subtitle_cooldown_seconds": round(self.client.throttle.cooldown_remaining(), 1),
             "last_run": self.store.last_run(),
         })

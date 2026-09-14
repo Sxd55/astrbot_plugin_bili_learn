@@ -92,6 +92,14 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, id);
 """
 
 FINAL_STATUSES = ("ingested", "excluded")
+SEARCH_TOKENS = 4
+
+
+def _escape_like(text: str) -> str:
+    """转义 LIKE 通配符，查询里的 % 和 _ 按普通字符处理。"""
+    return str(text).replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
 RETRY_LIMITS = {"no_subtitle": 2, "failed": 3}
 RETRY_BASE_SECONDS = {"no_subtitle": 7 * 86400, "failed": 3600}
 RETRY_MAX_SECONDS = {"no_subtitle": 7 * 86400, "failed": 86400}
@@ -480,6 +488,87 @@ class AuditStore:
                       audit_at, audit_status, audit_note, created_at, updated_at
                FROM videos ORDER BY updated_at DESC LIMIT ?""",
             (limit,),
+        )
+        return [dict(r) for r in rows]
+
+    def search_local(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """知识库不可用时的本地兜底：在摘要和汇总正文里做关键词匹配，零成本。
+
+        按空格拆成最多 4 个词做 OR 匹配；LIKE 通配符已转义，查询 `%` 不会全表命中。
+        """
+        text = str(query or "").strip()
+        if not text or limit <= 0:
+            return []
+        tokens = [part for part in text.split() if part][:SEARCH_TOKENS] or [text]
+        terms = [f"%{_escape_like(token)}%" for token in tokens]
+
+        video_where = " OR ".join(
+            "(title LIKE ? ESCAPE '!' OR summary LIKE ? ESCAPE '!' "
+            "OR doc_name LIKE ? ESCAPE '!' OR category LIKE ? ESCAPE '!')"
+            for _ in tokens
+        )
+        params: list[Any] = []
+        for term in terms:
+            params.extend([term, term, term, term])
+        params.append(max(1, int(limit)))
+        video_rows = self.query(
+            f"""SELECT bvid, title, doc_name, category, summary, status, updated_at
+                FROM videos WHERE summary!='' AND ({video_where})
+                ORDER BY updated_at DESC LIMIT ?""",
+            params,
+        )
+        items: list[dict[str, Any]] = [
+            {
+                "kind": "video",
+                "bvid": str(row["bvid"]),
+                "title": str(row["title"] or ""),
+                "doc_name": str(row["doc_name"] or ""),
+                "category": str(row["category"] or ""),
+                "summary": str(row["summary"] or ""),
+                "status": str(row["status"] or ""),
+            }
+            for row in video_rows
+        ]
+
+        digest_where = " OR ".join(
+            "(keyword LIKE ? ESCAPE '!' OR content LIKE ? ESCAPE '!')" for _ in tokens
+        )
+        params = []
+        for term in terms:
+            params.extend([term, term])
+        params.append(max(1, int(limit)))
+        digest_rows = self.query(
+            f"""SELECT keyword, doc_name, content, rounds, sources
+                FROM digests WHERE rounds>0 AND ({digest_where})
+                ORDER BY updated_at DESC LIMIT ?""",
+            params,
+        )
+        items.extend(
+            {
+                "kind": "digest",
+                "keyword": str(row["keyword"] or ""),
+                "doc_name": str(row["doc_name"] or ""),
+                "content": str(row["content"] or ""),
+                "rounds": int(row["rounds"] or 0),
+                "sources": int(row["sources"] or 0),
+            }
+            for row in digest_rows
+        )
+        return items[: max(1, int(limit))]
+
+    def category_counts(self) -> list[dict[str, Any]]:
+        rows = self.query(
+            """SELECT category, COUNT(*) AS n FROM videos
+               WHERE status='ingested' AND category!=''
+               GROUP BY category ORDER BY n DESC"""
+        )
+        return [{"category": str(r[0]), "count": int(r[1])} for r in rows]
+
+    def recent_ingested(self, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.query(
+            """SELECT bvid, title, category FROM videos
+               WHERE status='ingested' ORDER BY updated_at DESC LIMIT ?""",
+            (max(1, int(limit)),),
         )
         return [dict(r) for r in rows]
 
