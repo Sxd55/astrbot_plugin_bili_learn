@@ -15,7 +15,7 @@ desc: |-
   - 内置监控页：运行时间线、视频状态、兴趣词编辑、5 套配色与只读健康检查
 
   需要 AstrBot >= 4.5.7（兴趣词表格需要 >= 4.10.4）。
-version: 1.10.0
+version: 1.11.0
 author: Sxd55
 repo: https://github.com/Sxd55/astrbot_plugin_bili_learn
 astrbot_version: ">=4.5.7"

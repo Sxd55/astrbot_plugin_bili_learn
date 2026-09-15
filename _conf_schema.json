@@ -62,11 +62,50 @@
     "_special": "select_provider"
   },
   "utility_provider_id": {
-    "description": "工具模型（复审/审核，可空）",
+    "description": "复审模型（复审/审核，可空）",
     "type": "string",
-    "hint": "汇总复审和可信度审核用这个模型，建议选便宜的。留空则跟随摘要模型。",
+    "hint": "机械复读和可信度审核用的便宜模型；建议选便宜的。留空跟随摘要模型。",
     "default": "",
     "_special": "select_provider"
+  },
+  "fast_provider_id": {
+    "description": "快速模型（复审/审核）",
+    "type": "string",
+    "hint": "低延迟任务档位：汇总复审、可信度审核。显式填了「复审模型」时以显式为准；都留空则跟随摘要模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "quality_provider_id": {
+    "description": "精准模型（摘要/汇总）",
+    "type": "string",
+    "hint": "推理任务档位：视频摘要、主题汇总。显式填了「摘要模型」时以显式为准。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "fallback_provider_id": {
+    "description": "备用模型",
+    "type": "string",
+    "hint": "单次请求超过「单次 Token 上限」或模型明确拒答时，改用它重试一次；留空则不切换。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "daily_token_limit": {
+    "description": "每日 Token 硬限额",
+    "type": "int",
+    "hint": "本插件当天消耗（输入+输出）达到该值后停止一切内部模型调用，本轮以 budget_limited 收尾。0=不限；无限模式建议设一个。",
+    "default": 0
+  },
+  "soft_token_limit": {
+    "description": "每日 Token 软限额",
+    "type": "int",
+    "hint": "达到后只停低优先级任务（汇总复审、可信度审核），摘要与汇总继续。0=不限。",
+    "default": 0
+  },
+  "single_call_token_cap": {
+    "description": "单次请求 Token 上限（预估）",
+    "type": "int",
+    "hint": "按提示词估算输入；超过该值时优先改用「备用模型」，未配备用模型则照发并记日志。0=不限。",
+    "default": 0
   },
   "embedding_provider_id": {
     "description": "知识库 Embedding ID（可空）",

@@ -2,7 +2,7 @@
 
 从 B 站**公开视频**自动学习短摘要，写入 AstrBot 官方知识库；用户发链接/BV 号时 AI 可**按需读取单个视频**，也可以**主动查询已学知识**（检索、读全文、看概览）并用自己的人设回复。Cookie 选填，不点赞、不评论、不私信、不投币、不改人格文件。
 
-当前版本 `v1.10.0`。需要 AstrBot `>= 4.5.7`（官方知识库 + LLM 工具；兴趣词表格需要 `>= 4.10.4`）。纯标准库实现，无第三方依赖。
+当前版本 `v1.11.0`。需要 AstrBot `>= 4.5.7`（官方知识库 + LLM 工具；兴趣词表格需要 `>= 4.10.4`）。纯标准库实现，无第三方依赖。
 
 和 Savage Type 的分工：本插件管「世界知识」；Savage 管「谁说过什么」。本插件**不写** Savage 事实库，主链检索走 AstrBot 知识库 RAG。
 
@@ -113,6 +113,9 @@
 
 - **结构化输出**：提示词要求固定格式（标题/分区/相关度/要点），解析失败逐级兜底（标题用视频原标题、分区用关键词命中）。
 - **双模型路由**：摘要与汇总生成走 `summary_provider_id`；汇总复审、可信度审核这类机械核对走 `utility_provider_id`（建议配便宜模型），留空跟随摘要模型。
+- **任务分档**（v1.11.0）：新增「精准模型 `quality_provider_id`」与「快速模型 `fast_provider_id`」两个档位，分别覆盖摘要/汇总与复审/审核；显式单任务配置优先于档位，都留空则跟随当前会话模型，「实际用了哪个」会记账到面板。
+- **Token 预算闸**（v1.11.0）：`daily_token_limit` 硬限额达到后停止一切内部调用，本轮以 `budget_limited` 收尾（不把视频标成失败）；`soft_token_limit` 达到后只停复审/审核，摘要与汇总继续；`single_call_token_cap` 预估输入超限时改用 `fallback_provider_id`。消耗按任务记账（含 Provider 无 usage 时的本地估算），面板与 `/bilearn status` 可见今日 Token、限额与「预算跳过 N 次」。
+- **拒答重试**（v1.11.0）：模型返回「无法协助/作为一个AI」这类拒绝短语时，自动换 `fallback_provider_id` 重试一次，避免把拒答当摘要写进知识库。
 - **成本控制**：字幕头中尾采样（默认 12000 字）、审核素材限长（默认 4000）、复审来源采样 8000 字、汇总来源最多 30 条。
 
 ### 6. 汇总的「只增不删」实现
@@ -168,6 +171,12 @@
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
+| `enabled` | true | 总开关，关闭后定时与工具全部停用 |
+| `kb_name` | Bili Learn | 知识库名称；选定 Embedding 后不要改该库的向量维度 |
+| `sessdata` | 空 | B 站 SESSDATA（选填），只用于读登录可见的 AI 字幕 |
+| `embedding_provider_id` / `rerank_provider_id` | 空 | Embedding（知识库必填）与 Rerank；留空自动选第一个可用 |
+| `exclude_keywords` | 空 | 标题/简介/字幕含这些词的视频直接排除，逗号分隔 |
+| `request_interval_seconds` | 3 | B 站请求最小间隔秒数（0.5–30），风控冷却另算 |
 | `interest_quotas` | 空 | 兴趣词 + 每轮入库数量（表格，顺序即刷取顺序）；留空回退到 `keywords` |
 | `keywords` | 聊天技巧,暧昧拉扯技巧,AI,SKILLS,提示词,科技,数码,构图,审美,艺术 | 回退用关键词；同时作为知识库分区名 |
 | `unlimited_mode` | false | 无限模式：不设每日上限，一轮接一轮；**开启后立即开始刷取**，token 消耗大 |
@@ -177,6 +186,10 @@
 | `daily_quota_overrides` | 空 | 单关键词配额覆盖，如 `AI:5,科技:2` |
 | `summary_provider_id` | 空 | 摘要与汇总生成用的模型；留空跟随当前会话 |
 | `utility_provider_id` | 空 | 复审/审核用的便宜模型；留空跟随摘要模型 |
+| `quality_provider_id` / `fast_provider_id` | 空 | 任务档位：精准档（摘要/汇总）、快速档（复审/审核）；显式配置优先于档位 |
+| `fallback_provider_id` | 空 | 单次请求超 Token 上限或模型拒答时的备用模型 |
+| `daily_token_limit` / `soft_token_limit` | 0 | 每日 Token 硬限额 / 软限额（0=不限）；软限只停复审与审核 |
+| `single_call_token_cap` | 0 | 单次请求预估 Token 上限（0=不限），超出改用备用模型 |
 | `category_min_score` | 80 | 模型给分区的相关度低于该值时归入「其他」不入库；0=关闭 |
 | `subtitle_page_limit` | 3 | 多 P 读取数量，0=全部 |
 | `subtitle_max_chars` | 12000 | 送入模型的字幕上限，超长取头/中/尾 |
@@ -243,3 +256,20 @@
 ## 七、参考与许可
 
 学习流水线参考 [astrbot_plugin_b-](https://github.com/mjy1113451/astrbot_plugin_b-)（MIT）的「看 → 理解 → 归档」与字幕/风控实践；链接提取、多 P 字幕与采样参考 [astrbot_plugin_bilibili_parser](https://github.com/xiaowan138/astrbot_plugin_bilibili_parser)（MIT）；按需读的工具形态参考 [astrbot_plugin_biliread](https://github.com/SodaCodeSave/astrbot_plugin_biliread)（AGPL-3.0，仅思路，未复制代码）。本插件未移植其互动、下载与人格模块。
+
+---
+
+## 八、测试
+
+```text
+python tests/test_core.py -v
+```
+
+102 个测试，只用 Python 3.11+ 标准库，不联网。集成测试（23 个：真实 AstrBot 框架 + 假 KB/假 B 站/脚本化假模型，覆盖插件加载、全部命令、两个 LLM 工具、面板接口、配额/延期/汇总/审核全链路，以及任务分档、Token 预算闸、拒答重试；需 `pip install astrbot`）：
+
+```text
+python tests/test_integration.py -v
+```
+
+另有 1 个真实 B 站网络探针（只读：搜索 + 详情 + 字幕），默认跳过，`BILI_LIVE=1` 才跑。
+实机测试流程见 `SOAK.md`。`tests/verify_readme.py` 核查文档里的命令、配置、默认值与版本号是否和代码一致。

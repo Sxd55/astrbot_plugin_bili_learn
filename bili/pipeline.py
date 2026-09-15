@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Awaitable, Callable
 
 from .client import BiliClient, BiliRiskError
+from .llm import LLMBudgetExceeded
 from .ingest import (
     AUDIT_PROMPT,
     DIGEST_PROMPT,
@@ -39,6 +41,14 @@ DocDelete = Callable[[str], Awaitable[None]]
 REVIEW_SOURCES_CHARS = 8000
 
 
+def _split_keywords(raw: Any) -> list[str]:
+    """切分关键词配置：兼容中英文逗号、顿号、分号、空格与换行。
+
+    中文输入法默认全角标点，不处理的话「科技，数码」会变成一个关键词。
+    """
+    return [part for part in re.split(r"[,，、；;\s]+", str(raw or "")) if part.strip()]
+
+
 def _parse_interest_items(raw: Any) -> list[tuple[str, int]]:
     """解析 template_list 配置：每项 {keyword, quota}。"""
     plan: list[tuple[str, int]] = []
@@ -58,6 +68,14 @@ def _parse_interest_items(raw: Any) -> list[tuple[str, int]]:
         seen.add(keyword)
         plan.append((keyword, max(0, quota)))
     return plan
+
+
+def _as_int(value: Any, default: int) -> int:
+    """配置整数容错：非法输入回默认值，绝不让一轮任务崩掉。"""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
 
 
 class LearnPipeline:
@@ -98,35 +116,34 @@ class LearnPipeline:
         plan = _parse_interest_items(self.config.get("interest_quotas"))
         if plan:
             return [keyword for keyword, _ in plan]
-        raw = str(self.config.get("keywords") or "")
-        return [p.strip() for p in raw.split(",") if p.strip()]
+        return _split_keywords(self.config.get("keywords"))
 
     def interest_plan(self) -> list[tuple[str, int]]:
         """顺序执行计划：(关键词, 每轮入库目标数)。未配置时回退到 keywords。"""
         plan = _parse_interest_items(self.config.get("interest_quotas"))
         if plan:
             return plan
-        fallback = max(1, int(self.config.get("daily_per_keyword") or 3))
+        fallback = max(1, _as_int(self.config.get("daily_per_keyword"), 3) or 3)
         return [(keyword, fallback) for keyword in self.keywords()]
 
     def interest_configured(self) -> bool:
         return bool(_parse_interest_items(self.config.get("interest_quotas")))
 
     def exclude(self) -> list[str]:
-        raw = str(self.config.get("exclude_keywords") or "")
-        return [p.strip() for p in raw.split(",") if p.strip()]
+        return _split_keywords(self.config.get("exclude_keywords"))
 
     def subtitle_page_limit(self) -> int:
-        return int(self.config.get("subtitle_page_limit") or 3)
+        # 0=读全部 P（README 承诺的行为；以前 or 3 把 0 吃掉了）。
+        return _as_int(self.config.get("subtitle_page_limit"), 3)
 
     def subtitle_max_chars(self) -> int:
-        return int(self.config.get("subtitle_max_chars") or 12000)
+        return _as_int(self.config.get("subtitle_max_chars"), 12000) or 12000
 
     def verify_subtitle(self) -> bool:
         return bool(self.config.get("subtitle_verify", True))
 
     def max_duration(self) -> int:
-        minutes = int(self.config.get("max_duration_minutes") or 0)
+        minutes = _as_int(self.config.get("max_duration_minutes"), 0)
         return max(0, minutes) * 60
 
     def unlimited_mode(self) -> bool:
@@ -145,7 +162,7 @@ class LearnPipeline:
         return bool(self.config.get("consolidate_enabled", True))
 
     def consolidate_threshold(self) -> int:
-        return max(1, int(self.config.get("consolidate_threshold") or 10))
+        return max(1, _as_int(self.config.get("consolidate_threshold"), 10) or 10)
 
     def consolidate_delete_sources(self) -> bool:
         return bool(self.config.get("consolidate_delete_sources", True))
@@ -154,21 +171,21 @@ class LearnPipeline:
         return bool(self.config.get("audit_enabled", True))
 
     def audit_interval_days(self) -> int:
-        return max(1, int(self.config.get("audit_interval_days") or 7))
+        return max(1, _as_int(self.config.get("audit_interval_days"), 7) or 7)
 
     def audit_daily_limit(self) -> int:
-        return max(0, int(self.config.get("audit_daily_limit") or 20))
+        return max(0, _as_int(self.config.get("audit_daily_limit"), 20) or 20)
 
     def audit_excerpt_chars(self) -> int:
-        return max(500, int(self.config.get("audit_excerpt_chars") or 4000))
+        return max(500, _as_int(self.config.get("audit_excerpt_chars"), 4000) or 4000)
 
     def run_max_videos(self) -> int:
-        return max(1, int(self.config.get("run_max_videos") or 100))
+        return max(1, _as_int(self.config.get("run_max_videos"), 100) or 100)
 
     def daily_quota(self, keyword: str) -> int:
-        base = max(0, int(self.config.get("daily_per_keyword") or 0))
+        base = max(0, _as_int(self.config.get("daily_per_keyword"), 3))
         raw = str(self.config.get("daily_quota_overrides") or "")
-        for part in raw.replace("：", ":").split(","):
+        for part in re.split(r"[,，、；]+", raw.replace("：", ":")):
             name, sep, value = part.partition(":")
             if sep and name.strip() == keyword:
                 try:
@@ -334,6 +351,8 @@ class LearnPipeline:
                 return {"ok": True, "status": "skipped", "reason": "excluded", "bvid": bvid, "costly": True}
             try:
                 info = await self._summarize(meta, subtitle, item)
+            except LLMBudgetExceeded:
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.store.mark_retryable(bvid, "failed", f"llm_fail:{exc}", **kwargs)
                 return {"ok": False, "status": "failed", "reason": "llm_fail", "bvid": bvid, "error": str(exc), "costly": True}
@@ -376,6 +395,7 @@ class LearnPipeline:
                 source_excerpt=info.get("excerpt", ""),
                 **kwargs,
             )
+            self.store.quota_add(info["category"])
             return {
                 "ok": True,
                 "status": "ingested",
@@ -498,6 +518,8 @@ class LearnPipeline:
             try:
                 info = await self._summarize(meta, subtitle, None)
             except BiliRiskError:
+                raise
+            except LLMBudgetExceeded:
                 raise
             except Exception as exc:  # noqa: BLE001
                 return {"ok": False, "reason": "llm_fail", "bvid": bvid, "title": meta.get("title"), "message": f"摘要生成失败：{exc}"}
@@ -640,13 +662,16 @@ class LearnPipeline:
         sources_text = sample_text(sources_text, max(4000, self.subtitle_max_chars() * 2))
         round_no = int(digest.get("rounds") or 0) + 1
         date_str = now_bj()
-        points = (
-            await self.llm(
-                DIGEST_PROMPT.format(
-                    keyword=keyword, existing=existing_input or "（暂无）", sources=sources_text
+        try:
+            points = (
+                await self.llm(
+                    DIGEST_PROMPT.format(
+                        keyword=keyword, existing=existing_input or "（暂无）", sources=sources_text
+                    )
                 )
-            )
-        ).strip()
+            ).strip()
+        except LLMBudgetExceeded as exc:
+            return {"ok": False, "reason": "budget", "keyword": keyword, "budget_reason": exc.reason}
         if not points:
             self.store.save_digest(
                 keyword,
@@ -659,14 +684,17 @@ class LearnPipeline:
             )
             return {"ok": False, "reason": "empty_points", "keyword": keyword}
         review_llm = self._review_llm()
-        review = (
-            await review_llm(
-                DIGEST_REVIEW_PROMPT.format(
-                    points=points,
-                    sources=sample_text(sources_text, REVIEW_SOURCES_CHARS),
+        try:
+            review = (
+                await review_llm(
+                    DIGEST_REVIEW_PROMPT.format(
+                        points=points,
+                        sources=sample_text(sources_text, REVIEW_SOURCES_CHARS),
+                    )
                 )
-            )
-        ).strip()
+            ).strip()
+        except LLMBudgetExceeded as exc:
+            return {"ok": False, "reason": "budget", "keyword": keyword, "budget_reason": exc.reason}
         verdict, problems = review_verdict(review)
         if is_suspect_verdict(verdict):
             self.store.save_digest(
@@ -762,6 +790,8 @@ class LearnPipeline:
                         excerpt=clip(excerpt, self.audit_excerpt_chars()) or "（没有留存素材）",
                     )
                 )
+            except LLMBudgetExceeded as exc:
+                return self._audit_result(results, "budget", exc.reason)
             except Exception as exc:  # noqa: BLE001
                 self.store.mark_audit(str(row["bvid"]), "error", str(exc))
                 results.append({"bvid": row["bvid"], "status": "error"})
@@ -789,6 +819,8 @@ class LearnPipeline:
                             excerpt=source_text or "（没有留存来源摘要）",
                         )
                     )
+                except LLMBudgetExceeded as exc:
+                    return self._audit_result(results, "budget", exc.reason)
                 except Exception as exc:  # noqa: BLE001
                     self.store.mark_digest_audit(keyword, "error", str(exc))
                     results.append({"keyword": keyword, "status": "error"})
@@ -802,6 +834,19 @@ class LearnPipeline:
             "audited": len(results),
             "suspect": sum(1 for item in results if item.get("status") == "suspect"),
             "details": results,
+        }
+
+    @staticmethod
+    def _audit_result(
+        results: list[dict[str, Any]], reason: str, budget_reason: str = ""
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "audited": len(results),
+            "suspect": sum(1 for item in results if item.get("status") == "suspect"),
+            "details": results,
+            "reason": reason,
+            "budget_reason": budget_reason,
         }
 
     async def _run_keyword(
@@ -851,6 +896,13 @@ class LearnPipeline:
                 except BiliRiskError as exc:
                     stats["aborted"] = "rate_limited"
                     self.store.add_event(run_id, "video", "failed", f"风控中止：{exc}", bvid=bvid)
+                    return stats
+                except LLMBudgetExceeded as exc:
+                    stats["aborted"] = "budget"
+                    self.store.add_event(
+                        run_id, "video", "skipped",
+                        f"Token 预算闸拦截（{exc.reason}），本轮停止", bvid=bvid,
+                    )
                     return stats
                 if not result.get("costly", True):
                     stats["skipped"] += 1
@@ -974,6 +1026,8 @@ class LearnPipeline:
                         f"汇总「{digest_result.get('keyword')}」复审未通过，本轮未写入",
                         detail=str(digest_result.get("problems") or ""),
                     )
+                elif digest_result.get("reason") == "budget":
+                    self.store.add_event(run_id, "digest", "warning", "Token 预算闸拦截，跳过汇总")
             except Exception as exc:  # noqa: BLE001
                 self.store.add_event(run_id, "digest", "failed", f"汇总失败：{exc}")
             try:
@@ -986,10 +1040,14 @@ class LearnPipeline:
                         f"审核 {audit_result['audited']} 篇，可疑 {audit_result.get('suspect', 0)} 篇",
                         detail=str(audit_result.get("details"))[:800],
                     )
+                elif audit_result.get("reason") == "budget":
+                    self.store.add_event(run_id, "audit", "warning", "Token 预算闸拦截，跳过审核")
             except Exception as exc:  # noqa: BLE001
                 self.store.add_event(run_id, "audit", "failed", f"审核失败：{exc}")
             if aborted == "rate_limited":
                 run_status = "rate_limited"
+            elif aborted == "budget":
+                run_status = "budget_limited"
             elif failed == 0 and not aborted:
                 run_status = "completed"
             else:

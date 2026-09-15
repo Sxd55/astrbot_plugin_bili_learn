@@ -10,6 +10,13 @@ from astrbot.core.provider.provider import EmbeddingProvider, RerankProvider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_plugin_data_path
 
 from .bili.client import BiliClient
+from .bili.llm import (
+    BudgetGuard,
+    LLMBudgetExceeded,
+    estimate_tokens,
+    looks_refusal,
+    resolve_provider,
+)
 from .bili.pipeline import LearnPipeline
 from .bili.query import format_for_chat
 from .bili.reference import command_remainder
@@ -17,7 +24,7 @@ from .bili.runlog import fmt_ts
 from .bili.store import AuditStore
 
 PLUGIN_NAME = "astrbot_plugin_bili_learn"
-PLUGIN_VERSION = "1.10.0"
+PLUGIN_VERSION = "1.11.0"
 
 
 def _tool_classes():
@@ -52,19 +59,24 @@ class BiliLearnPlugin(Star):
         self.config = config or {}
         self.data_dir = _data_dir()
         self.store = AuditStore(self.data_dir / "bili_learn.db")
+        try:
+            interval = float(self.config.get("request_interval_seconds") or 3)
+        except (TypeError, ValueError):
+            interval = 3.0
         self.client = BiliClient(
             sessdata=str(self.config.get("sessdata") or ""),
-            interval=float(self.config.get("request_interval_seconds") or 3),
+            interval=interval,
         )
+        self._llm_guard: BudgetGuard | None = None
         self.pipeline = LearnPipeline(
             client=self.client,
             store=self.store,
-            llm=self._llm,
+            llm=self._llm_for("summary"),
             upload=self._upload,
             config=self.config,
             find_doc=self._find_doc_by_name,
             delete_doc=self._delete_doc,
-            utility_llm=self._utility_llm,
+            utility_llm=self._llm_for("utility"),
         )
         self._cron_id = None
         self._kb_id = ""
@@ -100,6 +112,10 @@ class BiliLearnPlugin(Star):
 
     def _start_background_run(self, trigger: str, wait: bool = False) -> bool:
         if self._run_lock.locked() and not wait:
+            return False
+        pending = sum(1 for task in self._bg_tasks if not task.done())
+        if pending >= 3:
+            logger.warning("Bili Learn: too many queued runs (%s), refuse %s", pending, trigger)
             return False
         task = asyncio.create_task(self._run_pipeline_queued(trigger))
         self._bg_tasks.add(task)
@@ -262,7 +278,11 @@ class BiliLearnPlugin(Star):
         return self._kb_id
 
     async def _ensure_cron(self) -> None:
-        hour = int(self.config.get("daily_start_hour", 1))
+        try:
+            hour = int(self.config.get("daily_start_hour", 1))
+        except (TypeError, ValueError):
+            logger.warning("Bili Learn: bad daily_start_hour=%r, cron disabled", self.config.get("daily_start_hour"))
+            return
         if hour < 0 or hour > 23:
             logger.info("Bili Learn: daily_start_hour=%s，未注册定时任务（只手动运行）", hour)
             return
@@ -315,25 +335,88 @@ class BiliLearnPlugin(Star):
         return await self._run_pipeline("cron")
 
     async def _llm(self, prompt: str) -> str:
-        pid = str(self.config.get("summary_provider_id") or "").strip()
-        if not pid:
-            try:
-                pid = await self.context.get_current_chat_provider_id("")
-            except Exception:
-                providers = self.context.get_all_providers()
-                if not providers:
-                    raise RuntimeError("no chat provider")
-                pid = providers[0].meta().id
-        resp = await self.context.llm_generate(chat_provider_id=pid, prompt=prompt)
-        return getattr(resp, "completion_text", "") or ""
+        """摘要任务（保留旧方法名给测试与外部调用）。"""
+        return await self._llm_task("summary", prompt)
 
     async def _utility_llm(self, prompt: str) -> str:
-        """复审/审核用的模型；未单独配置时跟随摘要模型。"""
-        pid = str(self.config.get("utility_provider_id") or "").strip()
-        if not pid:
-            return await self._llm(prompt)
-        resp = await self.context.llm_generate(chat_provider_id=pid, prompt=prompt)
-        return getattr(resp, "completion_text", "") or ""
+        """复审/审核任务。"""
+        return await self._llm_task("utility", prompt)
+
+    def llm_guard(self) -> BudgetGuard:
+        if self._llm_guard is None:
+            self._llm_guard = BudgetGuard(
+                self.config, lambda: self.store.llm_tokens_today()
+            )
+        return self._llm_guard
+
+    def _llm_for(self, task: str):
+        async def call(prompt: str) -> str:
+            return await self._llm_task(task, prompt)
+
+        return call
+
+    async def _resolve_provider_id(self, provider_id: str) -> str:
+        if provider_id:
+            return provider_id
+        try:
+            current = await self.context.get_current_chat_provider_id("")
+            if current:
+                return str(current)
+        except Exception:  # noqa: BLE001
+            pass
+        providers = self.context.get_all_providers()
+        if not providers:
+            raise RuntimeError("no chat provider")
+        return str(providers[0].meta().id)
+
+    async def _generate(self, provider_id: str, prompt: str) -> tuple[str, int, int]:
+        resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
+        text = str(getattr(resp, "completion_text", "") or "")
+        usage = getattr(resp, "usage", None)
+        tokens_in = int(getattr(usage, "input", 0) or 0) if usage is not None else 0
+        tokens_out = int(getattr(usage, "output", 0) or 0) if usage is not None else 0
+        if tokens_in <= 0:
+            tokens_in = estimate_tokens(prompt)
+        if tokens_out <= 0:
+            tokens_out = estimate_tokens(text)
+        return text, tokens_in, tokens_out
+
+    async def _llm_task(self, task: str, prompt: str) -> str:
+        """统一入口：预算闸 → 选模（显式/档位/默认）→ 调用 → 记账 → 拒答重试。"""
+        guard = self.llm_guard()
+        decision = guard.check(task, prompt)
+        if not decision.allowed:
+            self.store.add_llm_usage(task, "", 0, 0, ok=False, reason=decision.reason)
+            logger.warning(
+                "Bili Learn: LLM budget blocked task=%s reason=%s used=%s",
+                task, decision.reason, guard.status()["used"],
+            )
+            raise LLMBudgetExceeded(decision.reason)
+        configured, source = resolve_provider(task, self.config)
+        provider_id = await self._resolve_provider_id(configured)
+        if decision.provider_override:
+            source = decision.reason if decision.provider_override == configured else "single_call_cap"
+            provider_id = decision.provider_override
+        text, tokens_in, tokens_out = await self._generate(provider_id, prompt)
+        if looks_refusal(text):
+            fallback = guard.fallback_provider()
+            if fallback and fallback != provider_id:
+                self.store.add_llm_usage(
+                    task, provider_id, tokens_in, tokens_out, ok=True,
+                    source=source, reason="refusal_retry",
+                )
+                logger.warning(
+                    "Bili Learn: model refusal on task=%s, retrying with fallback %s",
+                    task, fallback,
+                )
+                text, tokens_in, tokens_out = await self._generate(fallback, prompt)
+                self.store.add_llm_usage(
+                    task, fallback, tokens_in, tokens_out, ok=True, source="fallback"
+                )
+                return text
+            logger.warning("Bili Learn: model refusal on task=%s (no fallback configured)", task)
+        self.store.add_llm_usage(task, provider_id, tokens_in, tokens_out, ok=True, source=source)
+        return text
 
     async def _upload(self, file_name: str, text: str, file_type: str) -> str:
         kb_id = self._kb_id or await self._ensure_kb()
@@ -566,9 +649,13 @@ class BiliLearnPlugin(Star):
         daily = self.store.daily_counts()
         quota_desc = "、".join(f"{k}:{v}" for k, v in daily.items()) or "无"
         audit = self.store.audit_stats()
-        mode = "无限（高消耗）" if self.pipeline.unlimited_mode() else f"每日配额 {self.config.get('daily_per_keyword')} 条/关键词"
+        tokens = self.tokens_status()
+        hard = tokens["hard_limit"] or "不限"
+        soft = tokens["soft_limit"] or "不限"
+        skipped = sum(item.get("count", 0) for item in tokens.get("skipped") or [])
+        mode = "无限（高消耗）" if self.pipeline.unlimited_mode() else f"每日配额 {self.config.get('daily_per_keyword') or 3} 条/关键词"
         yield event.plain_result(
-            f"Bili Learn 知识库={self.config.get('kb_name')} id={self._kb_id or '未创建'} "
+            f"Bili Learn 知识库={self.config.get('kb_name') or 'Bili Learn'} id={self._kb_id or '未创建'} "
             f"入库={counts.get('ingested', 0)} 排除={counts.get('excluded', 0)} "
             f"无字幕={counts.get('no_subtitle', 0)} 失败={counts.get('failed', 0)} "
             f"汇总={counts.get('digests', 0)} 已并入={counts.get('merged', 0)} "
@@ -577,6 +664,7 @@ class BiliLearnPlugin(Star):
             f"按需读={'开' if self._tool else '关'} "
             f"知识查询={'开' if self._query_tool else '关'} "
             f"模式={mode} 今日已入库={quota_desc} "
+            f"今日Token={tokens['used']}（硬限 {hard} / 软限 {soft} / 预算跳过 {skipped} 次） "
             f"Embedding={emb} Rerank={rerank} "
             f"上次运行={last.get('status') if last else '无'} "
             f"时间={fmt_ts(last.get('started_at')) if last else '无'} "
@@ -628,7 +716,7 @@ class BiliLearnPlugin(Star):
     async def cmd_once(self, event: AstrMessageEvent):
         """立刻跑一轮学习"""
         result = await self._run_pipeline("manual")
-        if result.get("skipped"):
+        if result.get("skipped") is True or result.get("reason") == "disabled":
             yield event.plain_result(f"未运行：{result.get('reason') or '已跳过'}")
             return
         if not result.get("ok"):
@@ -767,6 +855,13 @@ class BiliLearnPlugin(Star):
                 )
         yield event.plain_result("\n".join(lines))
 
+    def tokens_status(self) -> dict[str, Any]:
+        guard = self.llm_guard()
+        status = guard.status()
+        status["by_task"] = self.store.llm_usage_today_by_task()
+        status["skipped"] = self.store.llm_skips_today()
+        return status
+
     async def page_status(self):
         digests = [
             {
@@ -791,6 +886,7 @@ class BiliLearnPlugin(Star):
                 "cron_registered": bool(self._cron_id),
                 "next_run": self._next_run_text(),
                 "version": PLUGIN_VERSION,
+                "tokens": self.tokens_status(),
             }
         )
 
@@ -799,8 +895,8 @@ class BiliLearnPlugin(Star):
 
     async def page_run(self):
         busy = self._run_lock.locked()
-        self._start_background_run("manual", wait=True)
-        return json_response({"ok": True, "started": True, "queued": busy})
+        started = self._start_background_run("manual", wait=True)
+        return json_response({"ok": started, "started": started, "queued": busy})
 
     async def page_runs(self):
         return json_response({"items": self.store.recent_runs(30)})
@@ -910,7 +1006,7 @@ class BiliLearnPlugin(Star):
         if enabled:
             self.store.set_meta("unlimited_mode_last", "1")
             busy = self._run_lock.locked()
-            self._start_background_run("unlimited", wait=True)
-            return json_response({"enabled": True, "started": True, "queued": busy, "saved": saved})
+            started = self._start_background_run("unlimited", wait=True)
+            return json_response({"enabled": True, "started": started, "queued": busy, "saved": saved})
         self.store.set_meta("unlimited_mode_last", "0")
         return json_response({"enabled": False, "started": False, "queued": False, "saved": saved})

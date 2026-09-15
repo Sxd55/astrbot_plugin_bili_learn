@@ -37,6 +37,8 @@ from bili.ingest import (  # noqa: E402
     worth_keeping,
 )
 from bili.pipeline import LearnPipeline  # noqa: E402
+from bili.pipeline import _as_int, _split_keywords  # noqa: E402
+from bili.throttle import BiliThrottle  # noqa: E402
 from bili.query import (  # noqa: E402
     format_for_chat,
     format_for_llm,
@@ -1258,6 +1260,171 @@ class KnowledgeQueryTest(unittest.TestCase):
         self.assertIn("已入库视频 12 条", overview)
         self.assertIn("AI 8", overview)
         self.assertIn("汇总主题", overview)
+
+
+class ConfigRobustnessTest(unittest.TestCase):
+    """脏配置绝不能崩任务：非法值回默认值，显式 0 保持原有语义。"""
+
+    def _pipe(self, **config):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = AuditStore(Path(tmp.name) / "t.db")
+        self.addCleanup(store.close)
+        return LearnPipeline(None, store, None, None, config)
+
+    def test_as_int(self):
+        self.assertEqual(_as_int("abc", 3), 3)
+        self.assertEqual(_as_int(None, 3), 3)
+        self.assertEqual(_as_int("5", 3), 5)
+        self.assertEqual(_as_int(7, 3), 7)
+
+    def test_daily_quota_default_matches_readme(self):
+        pipe = self._pipe()
+        self.assertEqual(pipe.daily_quota("AI"), 3)
+        self.assertEqual(self._pipe(daily_per_keyword="bad").daily_quota("AI"), 3)
+        self.assertEqual(self._pipe(daily_per_keyword=0).daily_quota("AI"), 0)
+
+    def test_subtitle_page_limit_zero_means_all(self):
+        self.assertEqual(self._pipe().subtitle_page_limit(), 3)
+        self.assertEqual(self._pipe(subtitle_page_limit=0).subtitle_page_limit(), 0)
+        self.assertEqual(self._pipe(subtitle_page_limit="bad").subtitle_page_limit(), 3)
+
+    def test_fullwidth_separators(self):
+        pipe = self._pipe(keywords="科技，数码、AI；提示词 构图\n审美")
+        self.assertEqual(
+            pipe.keywords(), ["科技", "数码", "AI", "提示词", "构图", "审美"]
+        )
+        self.assertEqual(
+            self._pipe(exclude_keywords="广告，推广").exclude(), ["广告", "推广"]
+        )
+        pipe = self._pipe(daily_per_keyword=5, daily_quota_overrides="AI：9，科技:2")
+        self.assertEqual(pipe.daily_quota("AI"), 9)
+        self.assertEqual(pipe.daily_quota("科技"), 2)
+
+    def test_garbage_numbers_fall_back(self):
+        pipe = self._pipe(
+            consolidate_threshold="x", audit_interval_days="x",
+            audit_daily_limit="x", audit_excerpt_chars="x", run_max_videos="x",
+            max_duration_minutes="x",
+        )
+        self.assertEqual(pipe.consolidate_threshold(), 10)
+        self.assertEqual(pipe.audit_interval_days(), 7)
+        self.assertEqual(pipe.audit_daily_limit(), 20)
+        self.assertEqual(pipe.audit_excerpt_chars(), 4000)
+        self.assertEqual(pipe.run_max_videos(), 100)
+        self.assertEqual(pipe.max_duration(), 0)
+
+    def test_throttle_garbage_interval(self):
+        self.assertEqual(BiliThrottle("bad").min_gap, 3.0)
+        self.assertEqual(BiliThrottle(None).min_gap, 3.0)
+        self.assertEqual(BiliThrottle(0).min_gap, 0.5)
+
+
+class LLMStrategyTest(unittest.TestCase):
+    """任务分档 / Provider 回退链 / Token 预算闸 / 拒答识别。"""
+
+    def test_resolve_provider_precedence(self):
+        from bili.llm import resolve_provider
+
+        config = {
+            "summary_provider_id": "p-summary",
+            "utility_provider_id": "p-utility",
+            "fast_provider_id": "p-fast",
+            "quality_provider_id": "p-quality",
+        }
+        self.assertEqual(resolve_provider("summary", config), ("p-summary", "explicit:summary_provider_id"))
+        self.assertEqual(resolve_provider("utility", config), ("p-utility", "explicit:utility_provider_id"))
+        # 清掉显式配置后走档位
+        config["summary_provider_id"] = ""
+        config["utility_provider_id"] = ""
+        self.assertEqual(resolve_provider("summary", config), ("p-quality", "tier:quality"))
+        self.assertEqual(resolve_provider("utility", config), ("p-fast", "tier:fast"))
+        # 档位也空 → 跟随默认
+        config["fast_provider_id"] = ""
+        config["quality_provider_id"] = ""
+        self.assertEqual(resolve_provider("summary", config), ("", "default"))
+        self.assertEqual(resolve_provider("utility", config), ("", "default"))
+
+    def test_utility_falls_back_to_summary(self):
+        from bili.llm import resolve_provider
+
+        self.assertEqual(
+            resolve_provider("utility", {"summary_provider_id": "p-summary"}),
+            ("p-summary", "explicit:summary_provider_id"),
+        )
+
+    def test_estimate_tokens(self):
+        from bili.llm import estimate_tokens
+
+        self.assertEqual(estimate_tokens(""), 0)
+        self.assertEqual(estimate_tokens("中文四个字"), 5)
+        self.assertGreater(estimate_tokens("hello world"), 0)
+        long_cn = estimate_tokens("中" * 1000)
+        self.assertGreater(long_cn, 900)
+
+    def test_looks_refusal(self):
+        from bili.llm import looks_refusal
+
+        self.assertTrue(looks_refusal("抱歉，我无法提供该内容。"))
+        self.assertTrue(looks_refusal("作为一个AI，我不能协助这个请求"))
+        self.assertTrue(looks_refusal("I cannot help with that."))
+        self.assertFalse(looks_refusal("标题：测试视频摘要\n分区：科技\n相关度：90"))
+
+    def test_budget_hard_and_soft(self):
+        from bili.llm import BudgetGuard
+
+        used = {"n": 0}
+        guard = BudgetGuard(
+            {"daily_token_limit": 100, "soft_token_limit": 50},
+            lambda: used["n"],
+        )
+        self.assertTrue(guard.check("summary", "短提示词").allowed)
+        used["n"] = 60
+        self.assertTrue(guard.check("summary", "短提示词").allowed)
+        blocked = guard.check("utility", "短提示词")
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.reason, "soft_token_limit")
+        used["n"] = 100
+        hard = guard.check("summary", "短提示词")
+        self.assertFalse(hard.allowed)
+        self.assertEqual(hard.reason, "daily_token_limit")
+
+    def test_budget_single_call_cap(self):
+        from bili.llm import BudgetGuard
+
+        guard = BudgetGuard(
+            {
+                "single_call_token_cap": 10,
+                "fallback_provider_id": "p-backup",
+                "daily_token_limit": 0,
+                "soft_token_limit": 0,
+            },
+            lambda: 0,
+        )
+        decision = guard.check("summary", "这是一段很长的提示词" * 20)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.provider_override, "p-backup")
+        # 没配备用模型时不阻断，只是记录原因
+        guard2 = BudgetGuard({"single_call_token_cap": 10}, lambda: 0)
+        decision2 = guard2.check("summary", "这是一段很长的提示词" * 20)
+        self.assertTrue(decision2.allowed)
+        self.assertEqual(decision2.reason, "single_call_cap_no_fallback")
+
+    def test_store_llm_usage_ledger(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = AuditStore(Path(tmp.name) / "usage.db")
+        self.addCleanup(store.close)
+        store.add_llm_usage("summary", "p1", 100, 50, source="tier:quality")
+        store.add_llm_usage("utility", "p2", 20, 10, source="tier:fast")
+        store.add_llm_usage("utility", "", 0, 0, ok=False, reason="daily_token_limit")
+        self.assertEqual(store.llm_tokens_today(), 180)
+        rows = store.llm_usage_today_by_task()
+        self.assertEqual(rows[0]["task"], "summary")
+        self.assertEqual(rows[0]["tokens"], 150)
+        self.assertEqual({r["task"] for r in rows}, {"summary", "utility"})
+        skips = store.llm_skips_today()
+        self.assertEqual(skips[0]["reason"], "daily_token_limit")
 
 
 if __name__ == "__main__":
