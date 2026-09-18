@@ -299,3 +299,41 @@ def render_document(
 
 def now_bj() -> str:
     return datetime.now(BJ).strftime("%Y-%m-%d %H:%M")
+
+
+def format_seconds(seconds: int) -> str:
+    m, s = divmod(max(0, int(seconds)), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def render_conclusion(data: dict[str, Any]) -> str:
+    summary = str(data.get("summary") or "").strip()
+    outline = data.get("outline") or []
+    parts = []
+    if summary:
+        parts.append(f"【核心概述】\n{summary}")
+
+    outline_lines = []
+    if isinstance(outline, list):
+        for ch in outline:
+            if not isinstance(ch, dict):
+                continue
+            title = str(ch.get("title") or "").strip()
+            ts = ch.get("timestamp")
+            ts_prefix = f"[{format_seconds(ts)}] " if ts is not None else ""
+            outline_lines.append(f"• {ts_prefix}{title}")
+            for part in ch.get("part_outline") or []:
+                if not isinstance(part, dict):
+                    continue
+                p_content = str(part.get("content") or "").strip()
+                p_ts = part.get("timestamp")
+                p_prefix = f"  - {format_seconds(p_ts)} " if p_ts is not None else "  - "
+                if p_content:
+                    outline_lines.append(f"{p_prefix}{p_content}")
+    if outline_lines:
+        parts.append("【分段大纲】\n" + "\n".join(outline_lines))
+    return "\n\n".join(parts)
+

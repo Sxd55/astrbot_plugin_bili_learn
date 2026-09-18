@@ -23,11 +23,13 @@ from .ingest import (
     is_suspect_verdict,
     now_bj,
     parse_summary,
+    render_conclusion,
     render_digest,
     render_digest_section,
     render_document,
     review_verdict,
     sample_text,
+    sanitize_doc_title,
     worth_keeping,
 )
 from .runlog import new_run_id, next_day_start_bj, now_ts, today_start_ts
@@ -42,10 +44,12 @@ REVIEW_SOURCES_CHARS = 8000
 
 
 def _split_keywords(raw: Any) -> list[str]:
-    """切分关键词配置：兼容中英文逗号、顿号、分号、空格与换行。
-
-    中文输入法默认全角标点，不处理的话「科技，数码」会变成一个关键词。
-    """
+    """切分关键词配置：兼容列表、集合以及中英文标点分隔的字符串。"""
+    if isinstance(raw, (list, tuple, set)):
+        out = []
+        for item in raw:
+            out.extend(_split_keywords(item))
+        return [x for x in out if x]
     return [part for part in re.split(r"[,，、；;\s]+", str(raw or "")) if part.strip()]
 
 
@@ -108,6 +112,10 @@ class LearnPipeline:
     def _bvid_lock(self, bvid: str) -> asyncio.Lock:
         lock = self._bvid_locks.get(bvid)
         if lock is None:
+            if len(self._bvid_locks) > 1000:
+                idle_keys = [k for k, l in self._bvid_locks.items() if not l.locked()]
+                for k in idle_keys:
+                    self._bvid_locks.pop(k, None)
             lock = asyncio.Lock()
             self._bvid_locks[bvid] = lock
         return lock
@@ -201,6 +209,39 @@ class LearnPipeline:
         if quota <= 0:
             return 10 ** 9
         return max(0, quota - self.store.quota_used(keyword))
+
+    def conclusion_enabled(self) -> bool:
+        return bool(self.config.get("conclusion_first", True))
+
+    async def _try_conclusion(
+        self, meta: dict[str, Any], bvid: str, item: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        if not self.conclusion_enabled():
+            return None
+        try:
+            conclusion_data = await self.client.conclusion(bvid, meta.get("cid"))
+        except BiliRiskError:
+            raise
+        except Exception:  # noqa: BLE001
+            return None
+        if not conclusion_data:
+            return None
+        summary = render_conclusion(conclusion_data)
+        doc_title = sanitize_doc_title(meta.get("title") or bvid)
+        categories = self.keywords()
+        category = guess_category(
+            categories,
+            str(meta.get("title") or ""),
+            str(meta.get("desc") or ""),
+            str((item or {}).get("keyword") or "") if item else "",
+        )
+        return {
+            "summary": summary,
+            "doc_title": doc_title,
+            "category": category,
+            "material": "官方AI总结",
+            "excerpt": clip(conclusion_data.get("summary") or meta.get("desc") or "", 800),
+        }
 
     async def _subtitle_for(self, meta: dict[str, Any]) -> str:
         return await self.client.subtitles_for_pages(
@@ -335,32 +376,41 @@ class LearnPipeline:
                 "excerpt": str(row.get("source_excerpt") or ""),
             }
         else:
-            try:
-                subtitle = await self._subtitle_for(meta)
-            except BiliRiskError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self.store.mark_retryable(bvid, "failed", f"subtitle_fail:{exc}", **kwargs)
-                return {"ok": False, "status": "failed", "reason": "subtitle_fail", "bvid": bvid, "error": str(exc), "costly": True}
-            missing = str(self.config.get("missing_subtitle") or "desc_only")
-            if not subtitle and missing == "skip":
-                self.store.mark_retryable(bvid, "no_subtitle", "no_subtitle", **kwargs)
-                return {"ok": True, "status": "skipped", "reason": "no_subtitle", "bvid": bvid, "costly": True}
-            if not worth_keeping(meta.get("title") or "", meta.get("desc") or "", subtitle, self.exclude()):
-                self.store.mark_excluded(bvid, "excluded", **kwargs)
-                return {"ok": True, "status": "skipped", "reason": "excluded", "bvid": bvid, "costly": True}
-            try:
-                info = await self._summarize(meta, subtitle, item)
-            except LLMBudgetExceeded:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self.store.mark_retryable(bvid, "failed", f"llm_fail:{exc}", **kwargs)
-                return {"ok": False, "status": "failed", "reason": "llm_fail", "bvid": bvid, "error": str(exc), "costly": True}
-            categories = self.keywords()
-            if categories and info["category"] not in categories:
-                self.store.mark_excluded(bvid, "off_topic", summary=info["summary"], **kwargs)
-                return {"ok": True, "status": "skipped", "reason": "off_topic", "bvid": bvid, "costly": True}
-            doc_name = build_doc_name(info["category"], info["doc_title"])
+            conclusion_info = await self._try_conclusion(meta, bvid, item)
+            if conclusion_info is not None:
+                info = conclusion_info
+                categories = self.keywords()
+                if categories and info["category"] not in categories:
+                    self.store.mark_excluded(bvid, "off_topic", summary=info["summary"], **kwargs)
+                    return {"ok": True, "status": "skipped", "reason": "off_topic", "bvid": bvid, "costly": True}
+                doc_name = build_doc_name(info["category"], info["doc_title"])
+            else:
+                try:
+                    subtitle = await self._subtitle_for(meta)
+                except BiliRiskError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.store.mark_retryable(bvid, "failed", f"subtitle_fail:{exc}", **kwargs)
+                    return {"ok": False, "status": "failed", "reason": "subtitle_fail", "bvid": bvid, "error": str(exc), "costly": True}
+                missing = str(self.config.get("missing_subtitle") or "desc_only")
+                if not subtitle and missing == "skip":
+                    self.store.mark_retryable(bvid, "no_subtitle", "no_subtitle", **kwargs)
+                    return {"ok": True, "status": "skipped", "reason": "no_subtitle", "bvid": bvid, "costly": True}
+                if not worth_keeping(meta.get("title") or "", meta.get("desc") or "", subtitle, self.exclude()):
+                    self.store.mark_excluded(bvid, "excluded", **kwargs)
+                    return {"ok": True, "status": "skipped", "reason": "excluded", "bvid": bvid, "costly": True}
+                try:
+                    info = await self._summarize(meta, subtitle, item)
+                except LLMBudgetExceeded:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.store.mark_retryable(bvid, "failed", f"llm_fail:{exc}", **kwargs)
+                    return {"ok": False, "status": "failed", "reason": "llm_fail", "bvid": bvid, "error": str(exc), "costly": True}
+                categories = self.keywords()
+                if categories and info["category"] not in categories:
+                    self.store.mark_excluded(bvid, "off_topic", summary=info["summary"], **kwargs)
+                    return {"ok": True, "status": "skipped", "reason": "off_topic", "bvid": bvid, "costly": True}
+                doc_name = build_doc_name(info["category"], info["doc_title"])
         if self.quota_remaining(info["category"]) <= 0:
             self.store.mark_deferred(
                 bvid,
@@ -500,33 +550,41 @@ class LearnPipeline:
             excluded = False
             off_topic = False
         else:
-            try:
-                subtitle = await self._subtitle_for(meta)
-            except BiliRiskError:
-                raise
-            except Exception:  # noqa: BLE001
-                subtitle = ""
-            missing = str(self.config.get("missing_subtitle") or "desc_only")
-            if not subtitle and missing == "skip":
-                return {
-                    "ok": False,
-                    "reason": "no_subtitle",
-                    "bvid": bvid,
-                    "title": meta.get("title"),
-                    "message": f"《{meta.get('title') or bvid}》没有可用字幕，无法总结。",
-                }
-            try:
-                info = await self._summarize(meta, subtitle, None)
-            except BiliRiskError:
-                raise
-            except LLMBudgetExceeded:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "reason": "llm_fail", "bvid": bvid, "title": meta.get("title"), "message": f"摘要生成失败：{exc}"}
-            excluded = not worth_keeping(meta.get("title") or "", meta.get("desc") or "", subtitle, self.exclude())
-            categories = self.keywords()
-            off_topic = bool(categories) and info["category"] not in categories
-            doc_name = build_doc_name(info["category"], info["doc_title"])
+            conclusion_info = await self._try_conclusion(meta, bvid, None)
+            if conclusion_info is not None:
+                info = conclusion_info
+                excluded = not worth_keeping(meta.get("title") or "", meta.get("desc") or "", "", self.exclude())
+                categories = self.keywords()
+                off_topic = bool(categories) and info["category"] not in categories
+                doc_name = build_doc_name(info["category"], info["doc_title"])
+            else:
+                try:
+                    subtitle = await self._subtitle_for(meta)
+                except BiliRiskError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    subtitle = ""
+                missing = str(self.config.get("missing_subtitle") or "desc_only")
+                if not subtitle and missing == "skip":
+                    return {
+                        "ok": False,
+                        "reason": "no_subtitle",
+                        "bvid": bvid,
+                        "title": meta.get("title"),
+                        "message": f"《{meta.get('title') or bvid}》没有可用字幕，无法总结。",
+                    }
+                try:
+                    info = await self._summarize(meta, subtitle, None)
+                except BiliRiskError:
+                    raise
+                except LLMBudgetExceeded:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "reason": "llm_fail", "bvid": bvid, "title": meta.get("title"), "message": f"摘要生成失败：{exc}"}
+                excluded = not worth_keeping(meta.get("title") or "", meta.get("desc") or "", subtitle, self.exclude())
+                categories = self.keywords()
+                off_topic = bool(categories) and info["category"] not in categories
+                doc_name = build_doc_name(info["category"], info["doc_title"])
         doc_id = ""
         ingested = False
         already_ingested = bool(row and row.get("status") == "ingested")

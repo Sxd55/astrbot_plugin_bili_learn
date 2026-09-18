@@ -1427,5 +1427,212 @@ class LLMStrategyTest(unittest.TestCase):
         self.assertEqual(skips[0]["reason"], "daily_token_limit")
 
 
+class PipelineLockTest(unittest.TestCase):
+    def test_bvid_lock_eviction(self):
+        pipe = LearnPipeline(None, None, None, None, {})
+        for i in range(1005):
+            pipe._bvid_locks[f"BV{i}"] = asyncio.Lock()
+        active_lock = pipe._bvid_locks["BV500"]
+
+        async def _test():
+            await active_lock.acquire()
+            new_lock = pipe._bvid_lock("BV_NEW")
+            self.assertIn("BV500", pipe._bvid_locks)
+            self.assertIn("BV_NEW", pipe._bvid_locks)
+            self.assertLess(len(pipe._bvid_locks), 10)
+            active_lock.release()
+
+        asyncio.run(_test())
+
+
+class OfficialConclusionTest(unittest.TestCase):
+    def test_render_conclusion(self):
+        from bili.ingest import render_conclusion, format_seconds
+
+        self.assertEqual(format_seconds(65), "01:05")
+        self.assertEqual(format_seconds(3665), "01:01:05")
+
+        data = {
+            "summary": "这是全片核心概述。",
+            "outline": [
+                {
+                    "title": "背景介绍",
+                    "timestamp": 0,
+                    "part_outline": [
+                        {"timestamp": 10, "content": "问题背景与由来"},
+                    ],
+                },
+                {
+                    "title": "核心方案",
+                    "timestamp": 120,
+                    "part_outline": [
+                        {"timestamp": 130, "content": "架构设计与权衡"},
+                    ],
+                },
+            ],
+        }
+        text = render_conclusion(data)
+        self.assertIn("【核心概述】", text)
+        self.assertIn("这是全片核心概述。", text)
+        self.assertIn("【分段大纲】", text)
+        self.assertIn("• [00:00] 背景介绍", text)
+        self.assertIn("  - 00:10 问题背景与由来", text)
+        self.assertIn("• [02:00] 核心方案", text)
+        self.assertIn("  - 02:10 架构设计与权衡", text)
+
+    def test_pipeline_prefers_conclusion_without_llm(self):
+        """验证官方 AI 总结直取：不调用 LLM，1 秒内直接入库/返回。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = AuditStore(Path(tmp.name) / "test.db")
+        self.addCleanup(store.close)
+
+        llm_called = []
+
+        async def fake_llm(prompt: str) -> str:
+            llm_called.append(prompt)
+            return "标题：测试\n分区：科技\n相关度：90\n\n- 要点1"
+
+        uploaded = []
+
+        async def fake_upload(name: str, content: str, ext: str) -> str:
+            uploaded.append((name, content))
+            return "doc_123"
+
+        client = BiliClient()
+
+        async def fake_view(bvid: str = "", aid=None):
+            return {
+                "bvid": "BV1test_conc",
+                "cid": 12345,
+                "title": "科技新前沿解析",
+                "desc": "深入探讨",
+                "tname": "科技",
+                "author": "科普君",
+                "duration": 300,
+                "url": "https://www.bilibili.com/video/BV1test_conc",
+            }
+
+        async def fake_conclusion(bvid: str, cid=None):
+            return {
+                "summary": "官方提炼的核心论点",
+                "outline": [{"title": "第一章节", "timestamp": 0, "part_outline": []}],
+            }
+
+        client.view = fake_view
+        client.conclusion = fake_conclusion
+
+        config = {"enabled": True, "conclusion_first": True, "keywords": ["科技"]}
+        pipe = LearnPipeline(client, store, fake_llm, fake_upload, config)
+
+        res = asyncio.run(pipe.process_one({"bvid": "BV1test_conc", "keyword": "科技"}))
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res.get("status"), "ingested")
+        # 重点：完全不需要调用 LLM
+        self.assertEqual(len(llm_called), 0)
+        # 验证入库记录素材为官方AI总结
+        row = store.get("BV1test_conc")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.get("material"), "官方AI总结")
+        self.assertIn("官方提炼的核心论点", row.get("summary"))
+
+    def test_pipeline_fallback_when_conclusion_empty(self):
+        """验证当官方 AI 总结不存在时，平滑降级到字幕 + LLM 流程。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = AuditStore(Path(tmp.name) / "test.db")
+        self.addCleanup(store.close)
+
+        llm_called = []
+
+        async def fake_llm(prompt: str) -> str:
+            llm_called.append(prompt)
+            return "标题：测试视频\n分区：科技\n相关度：95\n\n- 本地模型总结要点"
+
+        uploaded = []
+
+        async def fake_upload(name: str, content: str, ext: str) -> str:
+            uploaded.append((name, content))
+            return "doc_456"
+
+        client = BiliClient()
+
+        async def fake_view(bvid: str = "", aid=None):
+            return {
+                "bvid": "BV1test_fallback",
+                "cid": 12345,
+                "title": "科技自制视频",
+                "desc": "自制内容",
+                "tname": "科技",
+                "author": "创作者",
+                "duration": 180,
+                "url": "https://www.bilibili.com/video/BV1test_fallback",
+            }
+
+        async def fake_conclusion(bvid: str, cid=None):
+            return None  # 无官方总结
+
+        async def fake_subtitles(meta, limit, verify):
+            return "00:01 大家好今天讲科技发展"
+
+        client.view = fake_view
+        client.conclusion = fake_conclusion
+        client.subtitles_for_pages = fake_subtitles
+
+        config = {"enabled": True, "conclusion_first": True, "keywords": ["科技"]}
+        pipe = LearnPipeline(client, store, fake_llm, fake_upload, config)
+
+        res = asyncio.run(pipe.process_one({"bvid": "BV1test_fallback", "keyword": "科技"}))
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res.get("status"), "ingested")
+        # 调用了 LLM 进行摘要
+        self.assertEqual(len(llm_called), 1)
+        row = store.get("BV1test_fallback")
+        self.assertEqual(row.get("material"), "字幕")
+
+    def test_read_one_prefers_conclusion(self):
+        """验证 read_one 按需读取也优先利用官方 AI 总结。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = AuditStore(Path(tmp.name) / "test.db")
+        self.addCleanup(store.close)
+
+        client = BiliClient()
+
+        async def fake_resolve(ref: str) -> str:
+            return "BV1read_conc"
+
+        async def fake_view(bvid: str = "", aid=None):
+            return {
+                "bvid": "BV1read_conc",
+                "cid": 99999,
+                "title": "按需视频标题",
+                "desc": "简介",
+                "tname": "科技",
+                "author": "科普UP",
+                "duration": 240,
+                "url": "https://www.bilibili.com/video/BV1read_conc",
+            }
+
+        async def fake_conclusion(bvid: str, cid=None):
+            return {
+                "summary": "按需官方总结",
+                "outline": [],
+            }
+
+        client.resolve_bvid = fake_resolve
+        client.view = fake_view
+        client.conclusion = fake_conclusion
+
+        config = {"enabled": True, "conclusion_first": True, "keywords": ["科技"]}
+        pipe = LearnPipeline(client, store, None, None, config)
+
+        res = asyncio.run(pipe.read_one("BV1read_conc", ingest=False))
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res.get("material"), "官方AI总结")
+        self.assertIn("按需官方总结", res.get("summary"))
+
+
 if __name__ == "__main__":
     unittest.main()
+

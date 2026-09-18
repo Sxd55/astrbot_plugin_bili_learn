@@ -31,6 +31,7 @@ NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
 SEARCH_URL = "https://api.bilibili.com/x/web-interface/search/type"
 VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
+CONCLUSION_URL = "https://api.bilibili.com/x/web-interface/view/conclusion"
 PLAYER_WBI_URL = "https://api.bilibili.com/x/player/wbi/v2"
 PLAYER_URL = "https://api.bilibili.com/x/player/v2"
 RECOMMEND_URL = "https://api.bilibili.com/x/web-interface/index/top/rcmd"
@@ -435,6 +436,39 @@ class BiliClient:
             "view_count": int(stat.get("view") or 0),
             "like_count": int(stat.get("like") or 0),
             "url": f"https://www.bilibili.com/video/{data.get('bvid') or bvid}",
+        }
+
+    async def conclusion(self, bvid: str, cid: Any = None) -> dict[str, Any] | None:
+        """获取 B 站官方 AI 总结（若视频已生成）。
+        返回包含 'summary' 与 'outline' 的字典，若无总结或获取失败则返回 None。
+        """
+        if not bvid:
+            return None
+        params: dict[str, Any] = {"bvid": bvid, "web_location": 1430654}
+        if cid:
+            params["cid"] = cid
+        try:
+            payload = await self._signed(
+                CONCLUSION_URL,
+                params,
+                f"https://www.bilibili.com/video/{bvid}",
+                retries=1,
+                retry_412=False,
+            )
+        except BiliRiskError:
+            raise
+        except Exception:  # noqa: BLE001
+            return None
+
+        data = payload.get("data") or {}
+        model_result = data.get("model_result") or {}
+        summary = str(model_result.get("summary") or "").strip()
+        outline = model_result.get("outline") or []
+        if not summary and not outline:
+            return None
+        return {
+            "summary": summary,
+            "outline": outline,
         }
 
     def _final_url_sync(self, url: str) -> str:

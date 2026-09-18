@@ -24,7 +24,7 @@ from .bili.runlog import fmt_ts
 from .bili.store import AuditStore
 
 PLUGIN_NAME = "astrbot_plugin_bili_learn"
-PLUGIN_VERSION = "1.11.1"
+PLUGIN_VERSION = "1.12.0"
 
 
 def _tool_classes():
@@ -209,8 +209,15 @@ class BiliLearnPlugin(Star):
                 await self.context.cron_manager.delete_job(self._cron_id)
         except Exception:
             pass
-        for task in list(self._bg_tasks):
+        tasks = [t for t in self._bg_tasks if not t.done()]
+        for task in tasks:
             task.cancel()
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass
+        self._bg_tasks.clear()
         try:
             self.store.close()
         except Exception:

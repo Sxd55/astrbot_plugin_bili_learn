@@ -708,6 +708,27 @@ class BiliIntegrationTest(unittest.TestCase):
         asyncio.run(self.plugin.pipeline.run(trigger="manual", kb_id="kb1"))
         self.assertIn("p-backup", self.ctx.llm_providers)
 
+    def test_terminate_waits_background_tasks(self):
+        cleaned_up = False
+
+        async def _fake_bg():
+            nonlocal cleaned_up
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                cleaned_up = True
+                raise
+
+        async def _test():
+            task = asyncio.create_task(_fake_bg())
+            await asyncio.sleep(0)
+            self.plugin._bg_tasks.add(task)
+            await self.plugin.terminate()
+            self.assertTrue(cleaned_up)
+            self.assertEqual(len(self.plugin._bg_tasks), 0)
+
+        asyncio.run(_test())
+
 
 @unittest.skipUnless(HAS_ASTRBOT, "astrbot package not installed")
 class LiveBiliProbeTest(unittest.TestCase):
