@@ -71,7 +71,9 @@ for route in sorted(set(routes)):
 ver_readme = re.search(r"当前版本 `v([^`]+)`", README).group(1)
 ver_main = re.search(r'PLUGIN_VERSION = "([^"]+)"', MAIN).group(1)
 ver_meta = re.search(r"version: ([^\s]+)", (ROOT / "metadata.yaml").read_text(encoding="utf-8")).group(1).lstrip("v")
-for where, ver in (("main", ver_main), ("metadata", ver_meta)):
+ver_init = re.search(r'__version__ = "([^"]+)"', (ROOT / "__init__.py").read_text(encoding="utf-8")).group(1)
+ver_json = json.loads((ROOT / ".astrbot-plugin" / "metadata.json").read_text(encoding="utf-8"))["version"].lstrip("v")
+for where, ver in (("main", ver_main), ("metadata", ver_meta), ("__init__", ver_init), ("metadata.json", ver_json)):
     check(f"version {where}=={ver_readme}", ver == ver_readme, f"{ver} vs {ver_readme}")
 soak_first = (ROOT / "SOAK.md").read_text(encoding="utf-8").splitlines()[0]
 check("SOAK version", f"v{ver_readme}" in soak_first, soak_first)
