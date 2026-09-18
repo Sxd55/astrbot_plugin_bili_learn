@@ -134,6 +134,7 @@
     "description": "没有字幕时",
     "type": "string",
     "options": ["skip", "desc_only"],
+    "labels": ["跳过该视频（稍后重试）", "降级处理（仅根据标题和简介做摘要）"],
     "hint": "skip=跳过该视频（7 天后重试，最多 2 次）；desc_only=只用标题和简介。",
     "default": "desc_only"
   },
