@@ -12,7 +12,11 @@ import time
 
 class BiliThrottle:
     def __init__(self, min_gap: float = 3.0):
-        self.min_gap = min(30.0, max(0.5, float(min_gap or 3.0)))
+        try:
+            gap = float(min_gap if min_gap is not None else 3.0)
+        except (TypeError, ValueError):
+            gap = 3.0
+        self.min_gap = min(30.0, max(0.5, gap))
         self._last = 0.0
         self._lock = asyncio.Lock()
         self._cooldown_until = 0.0

@@ -197,14 +197,20 @@ async function load(includeInterest = true) {
 
   const c = status.counts || {};
   const a = status.audit || {};
+  const tk = status.tokens || {};
   $("stats").innerHTML = [
     ["视频记录", c.videos], ["已入库", c.ingested], ["已并入", c.merged],
     ["汇总文档", c.digests], ["无字幕", c.no_subtitle], ["失败", c.failed],
     ["排除", c.excluded], ["审核可疑", a.suspect],
+    ["今日 Token", tk.used || 0],
     ["知识库", status.kb_id ? String(status.kb_id).slice(0, 8) : "未创建"],
   ].map(([k, v]) => `<div class="stat"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
 
   const lr = status.last_run;
+  const budgetSkips = (tk.skipped || []).reduce((n, x) => n + (Number(x.count) || 0), 0);
+  const tokenLine = tk.hard_limit
+    ? `${tk.used || 0} / ${tk.hard_limit}${tk.soft_limit ? `（软限 ${tk.soft_limit}）` : ""}`
+    : `${tk.used || 0} / 不限`;
   const daily = status.daily || {};
   const dailyDesc = Object.entries(daily).map(([k, v]) => `${esc(k)}:${esc(v)}`).join("、") || "无";
   const digests = (status.digests || []).map((d) =>
@@ -221,6 +227,7 @@ async function load(includeInterest = true) {
     <span><b>模式</b>${status.unlimited_mode ? "无限（高消耗）" : "每日配额"}</span>
     <span><b>定时</b>${schedule}</span>
     <span><b>今日入库</b>${dailyDesc}</span>
+    <span><b>今日 Token</b>${tokenLine}${budgetSkips ? ` · 预算跳过 ${budgetSkips} 次` : ""}</span>
     <span><b>汇总</b>${digests}</span>
     <span><b>审核</b>通过 ${esc(a.ok || 0)} / 可疑 ${esc(a.suspect || 0)} / 未审 ${esc(a.pending || 0)}</span>
     <span><b>上次任务</b>${lr ? `${fmtTime(lr.started_at)} ${esc(lr.status)}` : "暂无"}</span>`;
@@ -294,7 +301,7 @@ async function runOnce() {
   try {
     const r = await post("run", {});
     show(r);
-    toast(r.queued ? "已排队，当前任务结束后开始" : "已开始刷取");
+    toast(!r.started ? "任务太多，稍后再试" : r.queued ? "已排队，当前任务结束后开始" : "已开始刷取");
     await load(false);
   } finally {
     if (btn) btn.disabled = false;
@@ -353,7 +360,7 @@ document.addEventListener("click", async (event) => {
       const r = await post("unlimited", { enabled: target });
       unlimitedOn = Boolean(r.enabled);
       if (target) {
-        toast(r.queued ? "无限模式已开启，当前任务结束后立即开始" : "无限模式已开启，正在刷取（token 消耗大）");
+        toast(!r.started ? "已开启无限模式，但任务太多，稍后手动试跑" : r.queued ? "无限模式已开启，当前任务结束后立即开始" : "无限模式已开启，正在刷取（token 消耗大）");
       } else {
         toast("无限模式已关闭");
       }

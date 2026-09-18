@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS run_events (
     detail TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, id);
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    task TEXT NOT NULL DEFAULT '',
+    provider_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    ok INTEGER NOT NULL DEFAULT 1,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_day ON llm_usage(day, task);
 """
 
 FINAL_STATUSES = ("ingested", "excluded")
@@ -447,6 +460,71 @@ class AuditStore:
             "INSERT INTO run_events(run_id, ts, stage, status, bvid, message, detail) VALUES(?,?,?,?,?,?,?)",
             (run_id, now_ts(), stage, status, bvid, message[:240], detail[:800]),
         )
+
+    # ------------------------------------------------------------------
+    # LLM usage ledger (Token 预算与按任务消耗)
+    # ------------------------------------------------------------------
+
+    def add_llm_usage(
+        self,
+        task: str,
+        provider_id: str = "",
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        ok: bool = True,
+        source: str = "",
+        reason: str = "",
+    ) -> None:
+        self.execute(
+            """INSERT INTO llm_usage(ts, day, task, provider_id, source, ok, tokens_in, tokens_out, reason)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                now_ts(),
+                today_bj(),
+                str(task or ""),
+                str(provider_id or "")[:80],
+                str(source or "")[:60],
+                int(bool(ok)),
+                max(0, int(tokens_in or 0)),
+                max(0, int(tokens_out or 0)),
+                str(reason or "")[:80],
+            ),
+        )
+
+    def llm_tokens_today(self, day: str = "") -> int:
+        rows = self.query(
+            "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM llm_usage WHERE day=? AND ok=1",
+            (day or today_bj(),),
+        )
+        return int(rows[0][0] or 0)
+
+    def llm_usage_today_by_task(self, day: str = "") -> list[dict[str, Any]]:
+        rows = self.query(
+            """SELECT task, provider_id, COUNT(*) AS calls,
+                      SUM(tokens_in) AS tin, SUM(tokens_out) AS tout
+               FROM llm_usage WHERE day=? AND ok=1
+               GROUP BY task, provider_id ORDER BY (SUM(tokens_in) + SUM(tokens_out)) DESC""",
+            (day or today_bj(),),
+        )
+        return [
+            {
+                "task": str(r["task"]),
+                "provider_id": str(r["provider_id"]),
+                "calls": int(r["calls"] or 0),
+                "tokens_in": int(r["tin"] or 0),
+                "tokens_out": int(r["tout"] or 0),
+                "tokens": int(r["tin"] or 0) + int(r["tout"] or 0),
+            }
+            for r in rows
+        ]
+
+    def llm_skips_today(self, day: str = "") -> list[dict[str, Any]]:
+        rows = self.query(
+            """SELECT task, reason, COUNT(*) AS n FROM llm_usage
+               WHERE day=? AND ok=0 GROUP BY task, reason ORDER BY n DESC""",
+            (day or today_bj(),),
+        )
+        return [{"task": str(r["task"]), "reason": str(r["reason"]), "count": int(r["n"] or 0)} for r in rows]
 
     def get_meta(self, key: str) -> str:
         rows = self.query("SELECT value FROM meta WHERE key=?", (key,))
