@@ -24,7 +24,7 @@ from .bili.runlog import fmt_ts
 from .bili.store import AuditStore
 
 PLUGIN_NAME = "astrbot_plugin_bili_learn"
-PLUGIN_VERSION = "1.11.0"
+PLUGIN_VERSION = "1.11.1"
 
 
 def _tool_classes():
